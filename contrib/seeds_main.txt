@@ -1,0 +1,15 @@
+# Fixed seed nodes for MONEU (blockchain) mainnet.
+#
+# One address per line. A port may be given after a colon and defaults to
+# 8327 when it is left out. IPv6 goes in brackets so that the colons in the
+# address are not mistaken for the one before the port.
+#
+# Only addresses that can be reached from anywhere belong here. A private
+# address such as 192.168.1.10 means a different machine in every household
+# and would send new nodes nowhere.
+#
+# Regenerate with:
+#     python3 contrib/generate-seeds.py contrib/seeds_main.txt \
+#         > src/chainparamsseeds.h
+
+135.181.255.219:8327

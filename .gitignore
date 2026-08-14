@@ -1,0 +1,15 @@
+build/
+*.o
+*.a
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.pem
+*.key
+*.asc
+moneu.conf
+.rpc.cookie
+wallet.dat
+noise.dat
+__pycache__/
