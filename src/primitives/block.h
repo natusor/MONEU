@@ -5,7 +5,6 @@
 #define MONEU_PRIMITIVES_BLOCK_H
 
 #include "transaction.h"
-#include "leaf_reveal.h"
 #include "keys.h"
 #include "../chainparams.h"
 #include <vector>
@@ -23,7 +22,7 @@ private:
     uint32_t mVersion;
     bytes32 mPrevBlockHash;
     bytes32 mMerkleRoot;
-    bytes32 mRevealRoot;
+    bytes32 mLeafRoot;
     uint64_t mTimestamp;
     uint32_t mHeight;
     uint32_t mBits;
@@ -46,7 +45,7 @@ public:
     uint32_t GetVersion() const { return mVersion; }
     const bytes32& GetPrevBlockHash() const { return mPrevBlockHash; }
     const bytes32& GetMerkleRoot() const { return mMerkleRoot; }
-    const bytes32& GetRevealRoot() const { return mRevealRoot; }
+    const bytes32& GetLeafRoot() const { return mLeafRoot; }
     uint64_t GetTimestamp() const { return mTimestamp; }
     uint32_t GetHeight() const { return mHeight; }
     uint32_t GetBits() const { return mBits; }
@@ -56,7 +55,7 @@ public:
     void SetVersion(uint32_t version) { mVersion = version; mHashCached = false; }
     void SetPrevBlockHash(const bytes32& hash) { mPrevBlockHash = hash; mHashCached = false; }
     void SetMerkleRoot(const bytes32& root) { mMerkleRoot = root; mHashCached = false; }
-    void SetRevealRoot(const bytes32& root) { mRevealRoot = root; mHashCached = false; }
+    void SetLeafRoot(const bytes32& root) { mLeafRoot = root; mHashCached = false; }
     void SetTimestamp(uint64_t timestamp) { mTimestamp = timestamp; mHashCached = false; }
     void SetHeight(uint32_t height) { mHeight = height; mHashCached = false; }
     void SetBits(uint32_t bits) { mBits = bits; mHashCached = false; }
@@ -79,11 +78,9 @@ class Block {
 private:
     BlockHeader mHeader;
     std::vector<Transaction> mTransactions;
-    std::vector<LeafReveal>  mReveals;
 
 public:
     static constexpr size_t MAX_TRANSACTIONS = 10000;
-    static constexpr size_t MAX_REVEALS = 10000;
 
     Block();
     explicit Block(const BlockHeader& header);
@@ -91,22 +88,18 @@ public:
     const BlockHeader& GetHeader() const { return mHeader; }
     BlockHeader& GetMutableHeader() { return mHeader; }
     const std::vector<Transaction>& GetTransactions() const { return mTransactions; }
-    const std::vector<LeafReveal>& GetReveals() const { return mReveals; }
 
     void SetHeader(const BlockHeader& header) { mHeader = header; }
     void AddTransaction(const Transaction& tx);
     void ClearTransactions();
-    void AddReveal(const LeafReveal& reveal);
-    void ClearReveals();
 
     size_t GetTransactionCount() const { return mTransactions.size(); }
-    size_t GetRevealCount() const { return mReveals.size(); }
 
     bytes32 ComputeMerkleRoot() const;
     void UpdateMerkleRoot();
 
-    bytes32 ComputeRevealRoot() const;
-    void UpdateRevealRoot();
+    bytes32 ComputeLeafRoot() const;
+    void UpdateLeafRoot();
 
     void UpdateRoots();
 
@@ -142,7 +135,6 @@ public:
 
     BlockBuilder& AddTransaction(const Transaction& tx);
     BlockBuilder& AddCoinbase(const Transaction& coinbase);
-    BlockBuilder& AddReveal(const LeafReveal& reveal);
 
     Block Build();
     Block BuildAndFinalize();

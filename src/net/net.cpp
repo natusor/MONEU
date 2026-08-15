@@ -744,7 +744,6 @@ void ConnManager::HandleMessage(
         case MsgType::TX:
             HandleTx(node, msg);      break;
         case MsgType::REVEAL:
-            HandleReveal(node, msg);  break;
         case MsgType::BLOCK:
             HandleBlock(node, msg);   break;
         case MsgType::REJECT:
@@ -1008,36 +1007,6 @@ void ConnManager::HandleInv(
         NetMessage getDataMsg(
             MsgType::GETDATA, getDataPayload);
         node->PushMessage(getDataMsg);
-    }
-}
-
-void ConnManager::HandleReveal(
-    NodePtr node, const NetMessage& msg)
-{
-    if (msg.payload.size() < 32 + 4 + 4 + 4) {
-        node->AddMisbehavior(10);
-        return;
-    }
-    if (msg.payload.size() > MAX_PROTOCOL_MSG_SIZE) {
-        node->AddMisbehavior(20);
-        DisconnectNode(node, "REVEAL payload too large");
-        return;
-    }
-    try {
-        size_t offset = 0;
-        LeafReveal reveal = LeafReveal::Deserialize(
-            msg.payload.data(), msg.payload.size(), offset);
-        if (offset != msg.payload.size()) {
-            node->AddMisbehavior(10);
-            return;
-        }
-        if (mCallbacks.onReveal)
-            mCallbacks.onReveal(node->id, reveal);
-    } catch (const std::exception& e) {
-        std::cerr << "ConnManager: invalid REVEAL from "
-                  << "peer=" << node->id
-                  << ": " << e.what() << "\n";
-        node->AddMisbehavior(10);
     }
 }
 
@@ -2322,31 +2291,6 @@ void ConnManager::BroadcastTransaction(
                 std::cerr << "ConnManager: node "
                           << pair.second->addr
                                  .ToString()
-                          << " queue saturated\n";
-                continue;
-            }
-        }
-        pair.second->PushMessage(msg);
-    }
-}
-
-void ConnManager::BroadcastReveal(
-    const LeafReveal& reveal)
-{
-    std::vector<uint8_t> data = reveal.Serialize();
-    NetMessage msg(MsgType::REVEAL, data);
-    std::lock_guard<std::mutex> lock(mNodesMutex);
-    for (auto& pair : mNodes) {
-        if (!pair.second->IsFullyConnected())
-            continue;
-        {
-            std::lock_guard<std::mutex> qlock(
-                pair.second->sendMutex);
-            if (pair.second->sendQueue.size() >
-                MAX_QUEUE_PER_NODE)
-            {
-                std::cerr << "ConnManager: node "
-                          << pair.second->addr.ToString()
                           << " queue saturated\n";
                 continue;
             }

@@ -1149,27 +1149,6 @@ void RegisterBlockchainRPCCommands(RPCTable& table) {
             result["previousblockhash"] = BytesToHex(hdr.GetPrevBlockHash());
             result["ntx"]               = block.GetTransactionCount();
 
-            // The reveal section, which was not shown at all.
-            //
-            // A block carries two things: transactions and the proofs that
-            // settle them. Listing only the first left no way to answer the
-            // one question that matters here - whether a spend and the
-            // leaves that authorise it travelled together. The root is in
-            // the header, so it belongs beside the merkle root.
-            result["revealroot"] = BytesToHex(hdr.GetRevealRoot());
-            const std::vector<LeafReveal>& blockReveals = block.GetReveals();
-            result["nreveals"]   =
-                static_cast<uint64_t>(blockReveals.size());
-            json revealList = json::array();
-            for (size_t r = 0; r < blockReveals.size(); ++r) {
-                json rv;
-                rv["txid"]   = BytesToHex(blockReveals[r].GetTxid());
-                rv["height"] = blockReveals[r].GetHeight();
-                rv["proofs"] = static_cast<uint64_t>(
-                    blockReveals[r].GetProofs().size());
-                revealList.push_back(rv);
-            }
-            result["reveals"] = revealList;
             // Transaction ids in this block, in order (coinbase first).
             json txids = json::array();
             for (const auto& tx : block.GetTransactions()) {
@@ -1254,7 +1233,6 @@ void RegisterBlockchainRPCCommands(RPCTable& table) {
                 // pool alongside it. A transaction without them cannot be
                 // settled by any block, so this is the first thing to look
                 // at when one will not confirm.
-                e["hasreveal"] = entries[i].hasReveal;
 
                 // Inputs, split by where the output they name lives. One
                 // whose parent is neither in the pool nor on the chain can
@@ -1706,8 +1684,6 @@ void RegisterWalletRPCCommands(RPCTable& table) {
             // The leaves behind them are spent whatever happens next, so
             // an operator needs to see that something is outstanding
             // without reading the wallet file by hand.
-            result["prepared_reveals"] =
-                static_cast<uint64_t>(ctx.wallet->PreparedRevealCount());
 
             if (noiseLoaded) {
                 result["kps"] = BytesToHex(ctx.wallet->GetNoiseKps());
@@ -1801,9 +1777,6 @@ void RegisterWalletRPCCommands(RPCTable& table) {
                 // has a window of six blocks and no way of knowing the
                 // wallet came back. Send whatever is already publishable
                 // now rather than wait for the next block to notice.
-                if (ctx.publishReveals) {
-                    ctx.publishReveals();
-                }
                 if (moved > 0) {
                     return std::string(
                         "Wallet unlocked and noise file loaded; leaf "
@@ -2446,12 +2419,11 @@ void RegisterMiningRPCCommands(RPCTable& table) {
             result["version"]           = hdr.GetVersion();
             result["previousblockhash"] = BytesToHex(hdr.GetPrevBlockHash());
             result["merkleroot"]        = BytesToHex(hdr.GetMerkleRoot());
-            result["revealroot"]        = BytesToHex(hdr.GetRevealRoot());
+            result["leafroot"]          = BytesToHex(hdr.GetLeafRoot());
             result["curtime"]           = hdr.GetTimestamp();
             result["bits"]              = BitsToHex(hdr.GetBits());
             result["target"]            = TargetFromBits(hdr.GetBits());
             result["transactions"]      = tmpl.GetTransactionCount();
-            result["reveals"]           = tmpl.GetRevealCount();
             result["coinbasevalue"] =
                 tmpl.GetTransactions().empty()
                     ? 0

@@ -64,6 +64,14 @@ private:
 
     bool GetBlockHashByHeightLocked(uint32_t height, bytes32& hashOut) const;
 
+    bool ReplayBlocksLocked();
+    bool RollforwardBlockLocked(const bytes32& blockHash, uint32_t height);
+    bool RollbackBlockLocked(const bytes32& blockHash, uint32_t height);
+    bool LastCommonAncestorLocked(const bytes32& a, const bytes32& b,
+                                  bytes32& out) const;
+    bool AncestorPathLocked(const bytes32& from, const bytes32& to,
+                            std::vector<bytes32>& out) const;
+
     bool ApplyBlockTwoPhase(const Block& block,
                             uint32_t height,
                             BlockUndo* undoOut);

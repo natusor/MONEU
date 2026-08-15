@@ -23,15 +23,6 @@ static std::string MakeNoiseLeafDBKey(const bytes32& kps, uint32_t leafIndex) {
     }
     return key;
 }
-
-static std::string MakePendingDBKey(const bytes32& txid) {
-    std::string key;
-    key.reserve(1 + 32);
-    key.push_back(DB_PENDING);
-    key.append(reinterpret_cast<const char*>(txid.data()), txid.size());
-    return key;
-}
-
 UTXOSet::UTXOSet(const fs::path& dataDir, size_t nCacheSize)
     : mCacheSize(DEFAULT_CACHE_ENTRIES)
 {
@@ -57,6 +48,27 @@ UTXOSet::~UTXOSet() {
 bool UTXOSet::FlushCache(const bytes32& bestBlock) {
     DBBatch batch(*mDB);
     size_t batchSize = 0;
+
+    bytes32 oldTip;
+    oldTip.fill(0);
+    if (!mDB->Read(DB_UTXO_BEST, oldTip)) {
+        bytes32 markedNew, markedOld;
+        if (ReadHeadBlocksLocked(markedNew, markedOld)) {
+            oldTip = markedOld;
+        } else {
+            oldTip.fill(0);
+        }
+    }
+
+    std::vector<uint8_t> heads;
+    heads.reserve(64);
+    heads.insert(heads.end(), bestBlock.begin(), bestBlock.end());
+    heads.insert(heads.end(), oldTip.begin(), oldTip.end());
+
+    batch.Erase(DB_UTXO_BEST);
+    batch.Write(DB_UTXO_HEADS, heads);
+    mDB->WriteBatch(batch);
+    batch.Clear();
 
     for (auto& it : mCache) {
         if (!it.second.isDirty) continue;
@@ -85,8 +97,6 @@ bool UTXOSet::FlushCache(const bytes32& bestBlock) {
         }
     }
 
-    batch.Write(DB_UTXO_BEST, bestBlock);
-
     for (const auto& leaf : mSpentLeafDirty) {
         batch.Write(MakeNoiseLeafDBKey(leaf.kps, leaf.leafIndex),
                     static_cast<uint8_t>(1));
@@ -95,23 +105,13 @@ bool UTXOSet::FlushCache(const bytes32& bestBlock) {
         batch.Erase(MakeNoiseLeafDBKey(leaf.kps, leaf.leafIndex));
     }
 
-    for (const auto& txid : mPendingDirty) {
-        auto it = mPendingCache.find(txid);
-        if (it == mPendingCache.end()) continue;
-        const std::vector<uint8_t> blob = it->second.Serialize();
-        batch.Write(MakePendingDBKey(txid),
-                    std::string(blob.begin(), blob.end()));
-    }
-    for (const auto& txid : mErasedPendingDirty) {
-        batch.Erase(MakePendingDBKey(txid));
-    }
+    batch.Erase(DB_UTXO_HEADS);
+    batch.Write(DB_UTXO_BEST, bestBlock);
 
     mDB->WriteBatch(batch);
 
     mSpentLeafDirty.clear();
     mErasedLeafDirty.clear();
-    mPendingDirty.clear();
-    mErasedPendingDirty.clear();
 
     auto it = mCache.begin();
     while (it != mCache.end()) {
@@ -123,6 +123,88 @@ bool UTXOSet::FlushCache(const bytes32& bestBlock) {
     }
 
     mBestBlock = bestBlock;
+    return true;
+}
+
+bool UTXOSet::ReadHeadBlocksLocked(bytes32& newTip, bytes32& oldTip) const {
+    std::vector<uint8_t> heads;
+    if (!mDB->Read(DB_UTXO_HEADS, heads)) return false;
+    if (heads.size() != 64) return false;
+    std::memcpy(newTip.data(), heads.data(), 32);
+    std::memcpy(oldTip.data(), heads.data() + 32, 32);
+    return true;
+}
+
+bool UTXOSet::GetHeadBlocks(bytes32& newTip, bytes32& oldTip) const {
+    std::lock_guard<std::mutex> lock(mMutex);
+    return ReadHeadBlocksLocked(newTip, oldTip);
+}
+
+void UTXOSet::SpendCoinIfPresentLocked(const OutPoint& outpoint) {
+    auto it = mCache.find(outpoint);
+    if (it != mCache.end()) {
+        if (it->second.coin.isSpent) return;
+        it->second.coin.isSpent = true;
+        it->second.isDirty = true;
+        return;
+    }
+    Coin dbCoin;
+    if (!mDB->Read(outpoint, dbCoin)) return;
+    if (dbCoin.isSpent) return;
+    dbCoin.isSpent = true;
+    mCache[outpoint] = UTXOEntry(dbCoin, true, false);
+}
+
+void UTXOSet::AddCoinOverwriteLocked(const OutPoint& outpoint,
+                                     const Coin& coin) {
+    mCache[outpoint] = UTXOEntry(coin, true, true);
+}
+
+bool UTXOSet::ApplyTransactionForReplay(const Transaction& tx,
+                                        uint32_t height,
+                                        bool isCoinbase) {
+    std::lock_guard<std::mutex> lock(mMutex);
+
+    if (!isCoinbase) {
+        std::set<NoiseLeafKey> seenLeaves;
+        for (size_t i = 0; i < tx.GetInputCount(); ++i) {
+            const TxInput& input = tx.GetInputs()[i];
+            SpendCoinIfPresentLocked(
+                OutPoint(input.GetPrevTxHash(), input.GetOutputIndex()));
+
+            const std::vector<uint8_t>& proofBytes = input.GetNoiseProof();
+            if (proofBytes.empty()) continue;
+            try {
+                size_t offset = 0;
+                NoiseProof proof = NoiseProof::Deserialize(
+                    proofBytes.data(), proofBytes.size(), offset);
+                NoiseLeafKey leafKey(input.GetKps(), proof.leafIndex);
+                if (!seenLeaves.insert(leafKey).second) {
+                    std::cerr << "UTXOSet: duplicate noise leaf in "
+                                 "transaction\n";
+                    return false;
+                }
+                MarkNoiseLeafSpentLocked(leafKey.kps, leafKey.leafIndex);
+            } catch (const std::exception&) {
+                std::cerr << "UTXOSet: malformed noise proof\n";
+                return false;
+            }
+        }
+    }
+
+    const bytes32 txHash = tx.GetHash();
+    for (size_t i = 0; i < tx.GetOutputCount(); ++i) {
+        const TxOutput& output = tx.GetOutputs()[i];
+        if (output.IsUnspendable()) continue;
+        if (output.GetValue() <= 0) continue;
+        bytes32 outPubkeyHash;
+        if (!ExtractPubkeyHash(output.GetScriptPubKey(), outPubkeyHash)) {
+            continue;
+        }
+        AddCoinOverwriteLocked(
+            OutPoint(txHash, static_cast<uint32_t>(i)),
+            Coin(output.GetValue(), outPubkeyHash, height, isCoinbase));
+    }
     return true;
 }
 
@@ -514,321 +596,10 @@ void UTXOSet::UnmarkNoiseLeafSpentLocked(const bytes32& kps,
     mErasedLeafDirty.insert(key);
 }
 
-namespace {
-
-void PutLE32(std::vector<uint8_t>& out, uint32_t v) {
-    for (int b = 0; b < 4; ++b) {
-        out.push_back(static_cast<uint8_t>((v >> (8 * b)) & 0xFF));
-    }
-}
-
-void PutLE64(std::vector<uint8_t>& out, int64_t v) {
-    const uint64_t u = static_cast<uint64_t>(v);
-    for (int b = 0; b < 8; ++b) {
-        out.push_back(static_cast<uint8_t>((u >> (8 * b)) & 0xFF));
-    }
-}
-
-uint32_t TakeLE32(const uint8_t* d, size_t len, size_t& off) {
-    if (off + 4 > len) throw CryptoError("PendingSpend: truncated");
-    uint32_t v = 0;
-    for (int b = 3; b >= 0; --b) {
-        v = (v << 8) | static_cast<uint32_t>(d[off + b]);
-    }
-    off += 4;
-    return v;
-}
-
-int64_t TakeLE64(const uint8_t* d, size_t len, size_t& off) {
-    if (off + 8 > len) throw CryptoError("PendingSpend: truncated");
-    uint64_t v = 0;
-    for (int b = 7; b >= 0; --b) {
-        v = (v << 8) | static_cast<uint64_t>(d[off + b]);
-    }
-    off += 8;
-    return static_cast<int64_t>(v);
-}
-
-} // namespace
-
-std::vector<uint8_t> PendingSpend::Serialize() const {
-    std::vector<uint8_t> out;
-    const std::vector<uint8_t> txData = tx.Serialize();
-    PutLE32(out, static_cast<uint32_t>(txData.size()));
-    out.insert(out.end(), txData.begin(), txData.end());
-    PutLE32(out, height);
-    PutLE64(out, fee);
-    PutLE32(out, static_cast<uint32_t>(spentCoins.size()));
-    for (size_t i = 0; i < spentCoins.size(); ++i) {
-        const Coin& c = spentCoins[i];
-        PutLE64(out, c.value);
-        out.insert(out.end(), c.pubkeyHash.begin(), c.pubkeyHash.end());
-        PutLE32(out, c.height);
-        out.push_back(c.isCoinbase ? 1 : 0);
-    }
-    return out;
-}
-
-PendingSpend PendingSpend::Deserialize(const uint8_t* data, size_t len) {
-    if (data == NULL) throw CryptoError("PendingSpend: no data");
-    PendingSpend p;
-    size_t off = 0;
-
-    const uint32_t txLen = TakeLE32(data, len, off);
-    if (off + txLen > len) throw CryptoError("PendingSpend: truncated tx");
-    p.tx = Transaction::Deserialize(data + off, txLen);
-    off += txLen;
-
-    p.height = TakeLE32(data, len, off);
-    p.fee    = TakeLE64(data, len, off);
-
-    const uint32_t coinCount = TakeLE32(data, len, off);
-    if (coinCount > Transaction::MAX_INPUTS) {
-        throw CryptoError("PendingSpend: implausible coin count");
-    }
-    p.spentCoins.reserve(coinCount);
-    for (uint32_t i = 0; i < coinCount; ++i) {
-        Coin c;
-        c.value = TakeLE64(data, len, off);
-        if (off + 32 > len) throw CryptoError("PendingSpend: truncated coin");
-        std::memcpy(c.pubkeyHash.data(), data + off, 32);
-        off += 32;
-        c.height = TakeLE32(data, len, off);
-        if (off + 1 > len) throw CryptoError("PendingSpend: truncated coin");
-        c.isCoinbase = (data[off++] != 0);
-        c.isSpent = false;
-        p.spentCoins.push_back(c);
-    }
-    return p;
-}
-
-void UTXOSet::IndexPendingLocked(const PendingSpend& pending) {
-    const std::vector<TxInput>& inputs = pending.tx.GetInputs();
-    const bytes32 txid = pending.tx.GetHash();
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        mPendingByOutpoint[OutPoint(inputs[i].GetPrevTxHash(),
-                                    inputs[i].GetOutputIndex())] = txid;
-    }
-}
-
-void UTXOSet::UnindexPendingLocked(const PendingSpend& pending) {
-    const std::vector<TxInput>& inputs = pending.tx.GetInputs();
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        mPendingByOutpoint.erase(OutPoint(inputs[i].GetPrevTxHash(),
-                                          inputs[i].GetOutputIndex()));
-    }
-}
-
-bool UTXOSet::LoadPendingLocked(const bytes32& txid,
-                                PendingSpend& out) const {
-    auto it = mPendingCache.find(txid);
-    if (it != mPendingCache.end()) {
-        out = it->second;
-        return true;
-    }
-    if (mErasedPendingDirty.find(txid) != mErasedPendingDirty.end()) {
-        return false;
-    }
-    std::string blob;
-    if (!mDB->Read(MakePendingDBKey(txid), blob) || blob.empty()) {
-        return false;
-    }
-    try {
-        out = PendingSpend::Deserialize(
-            reinterpret_cast<const uint8_t*>(blob.data()), blob.size());
-    } catch (const std::exception&) {
-        return false;
-    }
-    return true;
-}
-
-bool UTXOSet::AddPendingSpend(const Transaction& tx,
-                              uint32_t height,
-                              const std::vector<Coin>& spentCoins,
-                              int64_t fee) {
-    std::lock_guard<std::mutex> lock(mMutex);
-
-    const bytes32 txid = tx.GetHash();
-    if (mPendingCache.find(txid) != mPendingCache.end()) {
-        return false;
-    }
-
-    const std::vector<TxInput>& inputs = tx.GetInputs();
-    if (inputs.empty() || spentCoins.size() != inputs.size()) {
-        return false;
-    }
-
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        const OutPoint op(inputs[i].GetPrevTxHash(),
-                          inputs[i].GetOutputIndex());
-        if (mPendingByOutpoint.find(op) != mPendingByOutpoint.end()) {
-            return false;
-        }
-        Coin existing;
-        if (!GetCoinLocked(op, existing) || existing.isSpent) {
-            return false;
-        }
-    }
-
-    PendingSpend pending;
-    pending.tx         = tx;
-    pending.height     = height;
-    pending.spentCoins = spentCoins;
-    pending.fee        = fee;
-
-    mPendingCache[txid] = pending;
-    mPendingDirty.insert(txid);
-    mErasedPendingDirty.erase(txid);
-    IndexPendingLocked(pending);
-    return true;
-}
-
-bool UTXOSet::GetPendingSpend(const bytes32& txid,
-                              PendingSpend& out) const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    return LoadPendingLocked(txid, out);
-}
-
-bool UTXOSet::HasPendingSpend(const bytes32& txid) const {
-    PendingSpend ignored;
-    return GetPendingSpend(txid, ignored);
-}
-
-bool UTXOSet::IsOutpointPending(const OutPoint& outpoint,
-                                bytes32* holderTxid) const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    auto it = mPendingByOutpoint.find(outpoint);
-    if (it == mPendingByOutpoint.end()) return false;
-    if (holderTxid) *holderTxid = it->second;
-    return true;
-}
-
-bool UTXOSet::FinalizePendingSpend(const bytes32& txid) {
-    std::lock_guard<std::mutex> lock(mMutex);
-
-    PendingSpend pending;
-    if (!LoadPendingLocked(txid, pending)) return false;
-
-    const std::vector<TxInput>& inputs = pending.tx.GetInputs();
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        SpendCoinLocked(OutPoint(inputs[i].GetPrevTxHash(),
-                                 inputs[i].GetOutputIndex()));
-    }
-
-    const std::vector<TxOutput>& outputs = pending.tx.GetOutputs();
-    for (size_t i = 0; i < outputs.size(); ++i) {
-        if (outputs[i].GetScriptPubKey().IsUnspendable()) continue;
-        bytes32 pkh;
-        if (!ExtractPubkeyHash(outputs[i].GetScriptPubKey(), pkh)) continue;
-        AddCoinLocked(OutPoint(txid, static_cast<uint32_t>(i)),
-                      Coin(outputs[i].GetValue(), pkh,
-                           pending.height, false));
-    }
-
-    UnindexPendingLocked(pending);
-    mPendingCache.erase(txid);
-    mPendingDirty.erase(txid);
-    mErasedPendingDirty.insert(txid);
-    return true;
-}
-
-bool UTXOSet::ReleasePendingSpend(const bytes32& txid) {
-    std::lock_guard<std::mutex> lock(mMutex);
-
-    PendingSpend pending;
-    if (!LoadPendingLocked(txid, pending)) return false;
-
-    UnindexPendingLocked(pending);
-    mPendingCache.erase(txid);
-    mPendingDirty.erase(txid);
-    mErasedPendingDirty.insert(txid);
-    return true;
-}
-
-std::vector<bytes32> UTXOSet::GetPendingSpendsAtHeight(
-    uint32_t height) const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    std::vector<bytes32> out;
-    for (const auto& entry : mPendingCache) {
-        if (entry.second.height == height) out.push_back(entry.first);
-    }
-    return out;
-}
-
-size_t UTXOSet::PendingSpendCount() const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    return mPendingCache.size();
-}
-
 bool UTXOSet::UnmarkNoiseLeafSpent(const bytes32& kps,
                                    uint32_t leafIndex) {
     std::lock_guard<std::mutex> lock(mMutex);
     UnmarkNoiseLeafSpentLocked(kps, leafIndex);
-    return true;
-}
-
-bool UTXOSet::UnfinalizePendingSpend(const Transaction& tx,
-                                     uint32_t pendingHeight,
-                                     const std::vector<Coin>& spentCoins,
-                                     int64_t fee) {
-    std::lock_guard<std::mutex> lock(mMutex);
-
-    const bytes32 txid = tx.GetHash();
-    const std::vector<TxInput>& inputs = tx.GetInputs();
-    if (spentCoins.size() != inputs.size()) return false;
-
-    const std::vector<TxOutput>& outputs = tx.GetOutputs();
-    for (size_t i = 0; i < outputs.size(); ++i) {
-        if (outputs[i].GetScriptPubKey().IsUnspendable()) continue;
-        bytes32 pkh;
-        if (!ExtractPubkeyHash(outputs[i].GetScriptPubKey(), pkh)) continue;
-        const OutPoint op(txid, static_cast<uint32_t>(i));
-        Coin existing;
-        if (GetCoinLocked(op, existing)) {
-            SpendCoinLocked(op);
-        }
-    }
-
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        const OutPoint op(inputs[i].GetPrevTxHash(),
-                          inputs[i].GetOutputIndex());
-        Coin restored = spentCoins[i];
-        restored.isSpent = false;
-        mCache[op] = UTXOEntry(restored, true, false);
-    }
-
-    PendingSpend pending;
-    pending.tx         = tx;
-    pending.height     = pendingHeight;
-    pending.spentCoins = spentCoins;
-    pending.fee        = fee;
-
-    mPendingCache[txid] = pending;
-    mPendingDirty.insert(txid);
-    mErasedPendingDirty.erase(txid);
-    IndexPendingLocked(pending);
-    return true;
-}
-
-bool UTXOSet::RestorePendingSpend(const Transaction& tx,
-                                  uint32_t pendingHeight,
-                                  const std::vector<Coin>& spentCoins,
-                                  int64_t fee) {
-    std::lock_guard<std::mutex> lock(mMutex);
-
-    const bytes32 txid = tx.GetHash();
-    if (spentCoins.size() != tx.GetInputs().size()) return false;
-
-    PendingSpend pending;
-    pending.tx         = tx;
-    pending.height     = pendingHeight;
-    pending.spentCoins = spentCoins;
-    pending.fee        = fee;
-
-    mPendingCache[txid] = pending;
-    mPendingDirty.insert(txid);
-    mErasedPendingDirty.erase(txid);
-    IndexPendingLocked(pending);
     return true;
 }
 
@@ -920,8 +691,6 @@ void UTXOSet::Clear() {
     mSpentLeafCache.clear();
     mSpentLeafDirty.clear();
     mErasedLeafDirty.clear();
-    mPendingDirty.clear();
-    mErasedPendingDirty.clear();
     mBestBlock.fill(0);
 }
 

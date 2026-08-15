@@ -2,7 +2,6 @@
 // Distributed under the MIT software license
 
 #include "block_validation.h"
-#include "reveal_validation.h"
 #include "../consensus/pow.h"
 #include <iostream>
 #include <unordered_set>
@@ -303,34 +302,6 @@ bool BlockValidation::CheckBlockTransactionsWithUTXO(
         }
     }
 
-    for (size_t r = 0; r < block.GetReveals().size(); ++r) {
-        storage::PendingSpend pending;
-        if (!utxoSet.GetPendingSpend(block.GetReveals()[r].GetTxid(),
-                                     pending)) {
-            state.SetInvalid(
-                BlockValidationResult::INVALID_TRANSACTION,
-                "Reveal " + std::to_string(r) +
-                " settles no held transaction");
-            return false;
-        }
-        if (pending.fee < 0) {
-            state.SetInvalid(
-                BlockValidationResult::INVALID_TRANSACTION,
-                "Reveal " + std::to_string(r) +
-                " settles a transaction with a negative fee");
-            return false;
-        }
-        const uint64_t fee = static_cast<uint64_t>(pending.fee);
-        const uint64_t newTotal = totalFees + fee;
-        if (newTotal < totalFees) {
-            state.SetInvalid(
-                BlockValidationResult::INVALID_TRANSACTION,
-                "Accumulated block fees out of range");
-            return false;
-        }
-        totalFees = newTotal;
-    }
-
     const uint64_t subsidy = NetParams::GetBlockSubsidy(currentHeight);
     uint64_t allowed = subsidy + totalFees;
     if (allowed < subsidy) {
@@ -381,38 +352,16 @@ bool BlockValidation::CheckBlockReveals(
     uint32_t currentHeight,
     BlockValidationState& state)
 {
-    const std::vector<LeafReveal>& reveals = block.GetReveals();
+    (void)utxoSet;
+    (void)currentHeight;
 
-    if (reveals.size() > Block::MAX_REVEALS) {
-        state.SetInvalid(
-            BlockValidationResult::INVALID_TRANSACTION,
-            "Block carries too many reveals");
-        return false;
-    }
-
-    if (!(block.ComputeRevealRoot() == block.GetHeader().GetRevealRoot())) {
+    if (!(block.ComputeLeafRoot() == block.GetHeader().GetLeafRoot())) {
         state.SetInvalid(
             BlockValidationResult::INVALID_MERKLE_ROOT,
-            "Reveal root does not match the reveal section");
+            "Leaf root does not match the noise proofs in this block");
         return false;
     }
 
-    if (reveals.empty()) {
-        return true;
-    }
-
-    std::string why;
-    const validation::RevealValidation::BlockTxIndex blockTxs =
-        validation::RevealValidation::IndexBlockTransactions(
-            block.GetTransactions());
-
-    if (!validation::RevealValidation::CheckBlockReveals(
-            reveals, currentHeight, utxoSet, why, &blockTxs)) {
-        state.SetInvalid(
-            BlockValidationResult::INVALID_TRANSACTION,
-            "Reveal section rejected: " + why);
-        return false;
-    }
     return true;
 }
 

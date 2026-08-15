@@ -1,6 +1,5 @@
 add_library(moneu_validation STATIC
     tx_validation.cpp
-    reveal_validation.cpp
     block_validation.cpp
 )
 

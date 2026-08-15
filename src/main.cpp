@@ -36,7 +36,6 @@
 extern "C" {
 #include "crypto/rand.h"
 }
-#include "validation/reveal_validation.h"
 #include "storage/chain_state.h"
 #include "consensus/mempool.h"
 #include "node/node_identity.h"
@@ -416,7 +415,6 @@ public:
     }
 };
 
-static void PublishPendingReveals(MoneuNode& node);
 
 static bool AcceptToMempool(MoneuNode& node,
                             const Transaction& tx,
@@ -467,7 +465,6 @@ static bool AcceptToMempool(MoneuNode& node,
 
     if (!node.mempool->AddTransaction(tx, fee)) return false;
 
-    PublishPendingReveals(node);
     return true;
 }
 
@@ -495,98 +492,9 @@ static void SyncMempoolWithChain(MoneuNode& node)
         }
     }
 
-    {
-        std::vector<bytes32> stillHeld;
-        const storage::UTXOSet& utxoSet = node.chainState->GetUTXOSet();
-        std::vector<LeafReveal> pooled =
-            node.mempool->GetReveals(Block::MAX_REVEALS);
-        for (size_t i = 0; i < pooled.size(); ++i) {
-            storage::PendingSpend p;
-            if (utxoSet.GetPendingSpend(pooled[i].GetTxid(), p)) {
-                stillHeld.push_back(pooled[i].GetTxid());
-                continue;
-            }
-            if (node.mempool->HasTransaction(pooled[i].GetTxid())) {
-                stillHeld.push_back(pooled[i].GetTxid());
-            }
-        }
-        node.mempool->DropRevealsNotHeld(stillHeld);
-    }
     for (const auto& tx : disconnected) {
         if (AcceptToMempool(node, tx, "REORG")) {
             LOG_INFO("REORG: resurrected TX into mempool");
-        }
-    }
-
-    PublishPendingReveals(node);
-}
-
-static void PublishPendingReveals(MoneuNode& node)
-{
-    if (!node.wallet || !node.chainState || !node.mempool) return;
-    if (!node.wallet->IsNoiseLoaded()) {
-        if (node.wallet && node.wallet->PreparedRevealCount() > 0) {
-            LOG_WARN("REVEAL: not publishing, the wallet is locked and " +
-                     std::to_string(node.wallet->PreparedRevealCount()) +
-                     " transaction(s) are waiting for their leaves - "
-                     "run walletunlock before the window closes");
-        }
-        return;
-    }
-    if (node.wallet->PreparedRevealCount() == 0) return;
-
-    const storage::UTXOSet& utxoSet = node.chainState->GetUTXOSet();
-    const uint32_t tip =
-        static_cast<uint32_t>(node.chainState->GetHeight());
-
-    std::vector<bytes32> waiting = node.wallet->GetPreparedRevealTxids();
-    for (size_t i = 0; i < waiting.size(); ++i) {
-        storage::PendingSpend pending;
-        if (!utxoSet.GetPendingSpend(waiting[i], pending)) {
-            if (node.mempool->HasTransaction(waiting[i])) {
-                if (node.mempool->HasReveal(waiting[i])) continue;
-                LeafReveal early;
-                if (!node.wallet->BuildReveal(early, waiting[i], 0)) continue;
-                if (node.mempool->AddReveal(early)) {
-                    LOG_DEBUG("REVEAL: published leaves alongside a pooled "
-                              "transaction");
-                    if (node.connManager) {
-                        node.connManager->BroadcastReveal(early);
-                    }
-                }
-                continue;
-            }
-            LOG_DEBUG("REVEAL: dropping the proof for a transaction that is "
-                      "neither held nor in the pool");
-            node.wallet->DropPreparedReveal(waiting[i]);
-            node.wallet->ReleaseOutpointsFor(waiting[i]);
-            continue;
-        }
-
-        if (pending.height > tip) continue;
-
-        if (node.mempool->HasReveal(waiting[i])) continue;
-
-        LeafReveal reveal;
-        if (!node.wallet->BuildReveal(reveal, waiting[i], pending.height)) {
-            LOG_WARN("REVEAL: not publishing, the wallet holds no proof for "
-                     "a transaction it has waiting");
-            continue;
-        }
-
-        std::string why;
-        if (validation::RevealValidation::CheckReveal(
-                reveal, tip + 1, utxoSet, why) !=
-            validation::RevealResult::VALID) {
-            LOG_WARN("REVEAL: not publishing, " + why);
-            continue;
-        }
-
-        if (node.mempool->AddReveal(reveal)) {
-            LOG_INFO("REVEAL: published leaves for a held transaction");
-            if (node.connManager) {
-                node.connManager->BroadcastReveal(reveal);
-            }
         }
     }
 }
@@ -793,34 +701,6 @@ int main(int argc, char* argv[]) {
             return node.chainState->GetBlockHashesAfter(forkHash, max);
         };
 
-        netCallbacks.onReveal = [&](
-            net::NodeId id, const LeafReveal& reveal)
-        {
-            (void)id;
-            if (!node.chainState || !node.mempool) return;
-
-            const storage::UTXOSet& utxoSet =
-                node.chainState->GetUTXOSet();
-            const uint32_t next =
-                static_cast<uint32_t>(node.chainState->GetHeight()) + 1;
-
-            std::string why;
-            const validation::RevealResult result =
-                validation::RevealValidation::CheckReveal(
-                    reveal, next, utxoSet, why);
-            if (result != validation::RevealResult::VALID) {
-                LOG_DEBUG("REVEAL rejected: " + why);
-                return;
-            }
-
-            if (node.mempool->AddReveal(reveal)) {
-                LOG_INFO("REVEAL accepted from a peer");
-                if (node.connManager) {
-                    node.connManager->BroadcastReveal(reveal);
-                }
-            }
-        };
-
         netCallbacks.onTransaction = [&](
             net::NodeId id, const Transaction& tx)
         {
@@ -955,9 +835,6 @@ int main(int argc, char* argv[]) {
             rpcContext.config         = &node.config;
             rpcContext.wallet         = node.wallet.get();
             rpcContext.miner          = node.miner.get();
-            rpcContext.publishReveals = [&node]() {
-                PublishPendingReveals(node);
-            };
 
             std::vector<std::string> allowedIPs =
                 node.config.GetRPC().rpcAllowIp;
@@ -1006,9 +883,6 @@ int main(int argc, char* argv[]) {
             rpcContext.config         = &node.config;
             rpcContext.wallet         = node.wallet.get();
             rpcContext.miner          = node.miner.get();
-            rpcContext.publishReveals = [&node]() {
-                PublishPendingReveals(node);
-            };
 
             std::vector<std::string> allowedIPs = {"127.0.0.1"};
 
@@ -1041,7 +915,6 @@ int main(int argc, char* argv[]) {
                 [](const Transaction& tx, void* context) {
                     Ctx* c = static_cast<Ctx*>(context);
                     if (c->node->wallet) {
-                        c->node->wallet->DropPreparedReveal(tx.GetHash());
                         c->node->wallet->ReleaseOutpointsFor(tx.GetHash());
                     }
                 };

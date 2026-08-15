@@ -194,73 +194,12 @@ Block Miner::BuildBlockTemplate(const bytes32& coinbaseOutputHash)
         }
     }
 
-    std::vector<LeafReveal> chosenReveals;
-    if (mMempool && mChainState) {
-        const storage::UTXOSet& utxoSet = mChainState->GetUTXOSet();
-        std::vector<LeafReveal> reveals =
-            mMempool->GetReveals(Block::MAX_REVEALS);
-
-        Block roomProbe;
-        roomProbe.GetMutableHeader() = hdr;
-        roomProbe.AddTransaction(
-            BuildCoinbase(height, subsidy, coinbaseOutputHash, extraNonce));
-        for (const auto& tx : body) {
-            roomProbe.AddTransaction(tx);
-        }
-        size_t used = roomProbe.GetSerializedSize() + 4;
-
-        std::map<std::string, const Transaction*> hereNow;
-        for (size_t i = 0; i < body.size(); ++i) {
-            const bytes32 h = body[i].GetHash();
-            hereNow[std::string(reinterpret_cast<const char*>(h.data()), 32)]
-                = &body[i];
-        }
-
-        for (size_t i = 0; i < reveals.size(); ++i) {
-            storage::PendingSpend pending;
-            bool settlesHere = false;
-
-            if (!utxoSet.GetPendingSpend(reveals[i].GetTxid(), pending)) {
-                const std::string key(
-                    reinterpret_cast<const char*>(
-                        reveals[i].GetTxid().data()), 32);
-                std::map<std::string, const Transaction*>::const_iterator it =
-                    hereNow.find(key);
-                if (it == hereNow.end()) {
-                    continue;
-                }
-                uint64_t txFee = 0;
-                if (!ComputeTxFee(*it->second, txFee)) continue;
-                pending.tx     = *it->second;
-                pending.height = height;
-                pending.fee    = static_cast<int64_t>(txFee);
-                settlesHere    = true;
-            }
-            (void)settlesHere;
-            if (pending.fee < 0) continue;
-
-            const size_t projected =
-                used + 4 + reveals[i].GetSerializedSize();
-            if (projected > NetParams::MAX_BLOCK_SIZE) break;
-
-            const uint64_t fee = static_cast<uint64_t>(pending.fee);
-            const uint64_t newTotal = totalFees + fee;
-            if (newTotal < totalFees) break;
-
-            totalFees = newTotal;
-            used = projected;
-            chosenReveals.push_back(reveals[i]);
-        }
-    }
 
     block.AddTransaction(
         BuildCoinbase(height, subsidy + totalFees,
                       coinbaseOutputHash, extraNonce));
     for (const auto& tx : body) {
         block.AddTransaction(tx);
-    }
-    for (const auto& reveal : chosenReveals) {
-        block.AddReveal(reveal);
     }
 
     block.UpdateRoots();
@@ -508,8 +447,7 @@ bool Miner::SubmitBlock(const Block& block)
     MONEU_LOG_INFO("Miner: found block at height " +
                    std::to_string(block.GetHeader().GetHeight()) +
                    " hash=" + HashToHex(block.GetHeader().GetHash()) +
-                   " tx=" + std::to_string(block.GetTransactionCount()) +
-                   " reveals=" + std::to_string(block.GetRevealCount()));
+                   " tx=" + std::to_string(block.GetTransactionCount()));
 
     if (mConnManager) {
         mConnManager->BroadcastBlock(block);

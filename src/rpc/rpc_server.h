@@ -149,7 +149,6 @@ struct RPCContext {
     // otherwise only tries this when a block connects, so a wallet
     // unlocked inside the six-block window would sit on a usable proof
     // until the next block instead of sending it at once.
-    std::function<void()>     publishReveals;
 
     RPCContext()
         : chainState(nullptr)
@@ -158,7 +157,6 @@ struct RPCContext {
         , config(nullptr)
         , wallet(nullptr)
         , miner(nullptr)
-        , publishReveals()
     {}
 };
 

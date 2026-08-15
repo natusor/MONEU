@@ -6,7 +6,6 @@
 
 #include "../primitives/block.h"
 #include "../primitives/transaction.h"
-#include "../primitives/leaf_reveal.h"
 #include "../chainparams.h"
 #include "addrman.h"
 
@@ -301,8 +300,6 @@ using NodePtr = std::shared_ptr<Node>;
 struct NetCallbacks {
     std::function<void(NodeId,
                        const Transaction&)> onTransaction;
-    std::function<void(uint64_t,
-                       const LeafReveal&)> onReveal;
     std::function<bool(uint32_t&, bytes32&)> getChainTip;
     std::function<std::vector<bytes32>(const bytes32&, size_t)>
         getBlockHashesAfter;
@@ -464,8 +461,6 @@ private:
                           const NetMessage& msg);
     void HandleTx(NodePtr node,
                   const NetMessage& msg);
-    void HandleReveal(NodePtr node,
-                  const NetMessage& msg);
     void HandleBlock(NodePtr node,
                      const NetMessage& msg);
     void HandleGetAddr(NodePtr node);
@@ -530,7 +525,6 @@ public:
     void ClearBanned();
 
     void BroadcastTransaction(const Transaction& tx);
-    void BroadcastReveal(const LeafReveal& reveal);
 
     void RequestBlocksFrom(NodeId nodeId);
     void BroadcastBlock(const Block& block);

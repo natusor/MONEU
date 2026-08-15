@@ -4,7 +4,6 @@
 #include "chain_state.h"
 #include "log/log.h"
 #include "../crypto/arith_uint256.h"
-#include "../validation/reveal_validation.h"
 #include "../validation/block_validation.h"
 #include "../consensus/pow.h"
 #include <iostream>
@@ -134,16 +133,27 @@ bool ChainState::Initialize() {
         }
     }
 
+    bytes32 pendingNew, pendingOld;
+    const bool interrupted = mUTXOSet->GetHeadBlocks(pendingNew, pendingOld);
     const bytes32 utxoBest = mUTXOSet->GetBestBlock();
-    if (!(utxoBest == mBestChain.blockHash)) {
-        MONEU_LOG_ERROR("Chain state is inconsistent: the tip is " +
-                        HexOf(mBestChain.blockHash) +
-                        " but the UTXO set belongs to " + HexOf(utxoBest) +
-                        ". The node was interrupted while committing a "
-                        "block. Delete the chainstate and blocks "
-                        "directories and resynchronise.");
-        throw DBError("Chain tip and UTXO set disagree - interrupted "
-                      "commit, resynchronisation required");
+
+    if (interrupted || !(utxoBest == mBestChain.blockHash)) {
+        MONEU_LOG_INFO("ChainState: the UTXO set is at " + HexOf(utxoBest) +
+                       " while the tip is " + HexOf(mBestChain.blockHash) +
+                       " - the node was stopped without committing; "
+                       "replaying the blocks in between");
+        if (!ReplayBlocksLocked()) {
+            MONEU_LOG_ERROR("Chain state is inconsistent: the tip is " +
+                            HexOf(mBestChain.blockHash) +
+                            " but the UTXO set belongs to " +
+                            HexOf(mUTXOSet->GetBestBlock()) +
+                            ", which is not a block on the way to it. The "
+                            "chain data cannot be reconciled by replaying.");
+            throw DBError("Chain tip and UTXO set disagree - the recorded "
+                          "block is not an ancestor of the tip");
+        }
+        MONEU_LOG_INFO("ChainState: replay finished, the UTXO set now "
+                       "matches the tip");
     }
 
     mInitialized = true;
@@ -207,8 +217,238 @@ bool ChainState::InitializeGenesisLocked() {
     mDB->Write(DB_CHAIN_GENESIS, genesisHash);
     mUTXOSet->SetBestBlock(genesisHash);
 
+    if (!mUTXOSet->Flush()) {
+        std::cerr << "ChainState: failed to commit the genesis "
+                     "UTXO set\n";
+        return false;
+    }
+
     std::cerr << "ChainState: genesis block materialized "
                  "at height 0\n";
+    return true;
+}
+
+bool ChainState::AncestorPathLocked(const bytes32& from,
+                                    const bytes32& to,
+                                    std::vector<bytes32>& out) const
+{
+    out.clear();
+    if (from == to) return true;
+
+    bytes32 cursor = from;
+    const size_t maxSteps = static_cast<size_t>(mBestChain.height) + 2;
+
+    for (size_t step = 0; step < maxSteps; ++step) {
+        out.push_back(cursor);
+        BlockIndexEntry entry;
+        if (!mBlockData->ReadBlockIndex(cursor, entry)) return false;
+        if (entry.hashPrev == to) return true;
+        if (entry.nHeight == 0) return false;
+        cursor = entry.hashPrev;
+    }
+    return false;
+}
+
+bool ChainState::LastCommonAncestorLocked(const bytes32& a,
+                                          const bytes32& b,
+                                          bytes32& out) const
+{
+    BlockIndexEntry ea, eb;
+    if (!mBlockData->ReadBlockIndex(a, ea)) return false;
+    if (!mBlockData->ReadBlockIndex(b, eb)) return false;
+
+    bytes32 ca = a, cb = b;
+    const size_t maxSteps = static_cast<size_t>(mBestChain.height) + 2;
+
+    for (size_t step = 0; step < maxSteps && ea.nHeight > eb.nHeight; ++step) {
+        ca = ea.hashPrev;
+        if (!mBlockData->ReadBlockIndex(ca, ea)) return false;
+    }
+    for (size_t step = 0; step < maxSteps && eb.nHeight > ea.nHeight; ++step) {
+        cb = eb.hashPrev;
+        if (!mBlockData->ReadBlockIndex(cb, eb)) return false;
+    }
+    for (size_t step = 0; step < maxSteps; ++step) {
+        if (ca == cb) { out = ca; return true; }
+        if (ea.nHeight == 0 || eb.nHeight == 0) return false;
+        ca = ea.hashPrev;
+        cb = eb.hashPrev;
+        if (!mBlockData->ReadBlockIndex(ca, ea)) return false;
+        if (!mBlockData->ReadBlockIndex(cb, eb)) return false;
+    }
+    return false;
+}
+
+bool ChainState::RollforwardBlockLocked(const bytes32& blockHash,
+                                        uint32_t height)
+{
+    BlockIndexEntry entry;
+    if (!mBlockData->ReadBlockIndex(blockHash, entry)) {
+        MONEU_LOG_ERROR("ChainState: replay cannot read the index entry for " +
+                        HexOf(blockHash));
+        return false;
+    }
+
+    Block block;
+    if (!mBlockData->ReadBlock(block, entry.blockPos)) {
+        MONEU_LOG_ERROR("ChainState: replay cannot read block " +
+                        HexOf(blockHash) + " from disk");
+        return false;
+    }
+
+    if (block.GetHeader().GetHash() != blockHash) {
+        MONEU_LOG_ERROR("ChainState: replay read a block whose hash is not " +
+                        HexOf(blockHash));
+        return false;
+    }
+
+    const std::vector<Transaction>& txs = block.GetTransactions();
+    for (size_t i = 0; i < txs.size(); ++i) {
+        const bool isCoinbase = (i == 0 && txs[i].IsCoinbase());
+        if (!mUTXOSet->ApplyTransactionForReplay(txs[i], height, isCoinbase)) {
+            MONEU_LOG_ERROR("ChainState: replay failed on transaction " +
+                            std::to_string(i) + " of the block at height " +
+                            std::to_string(height));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ChainState::RollbackBlockLocked(const bytes32& blockHash,
+                                     uint32_t height)
+{
+    if (height == 0) return true;
+
+    BlockIndexEntry entry;
+    if (!mBlockData->ReadBlockIndex(blockHash, entry)) {
+        MONEU_LOG_ERROR("ChainState: rollback cannot read the index entry "
+                        "for " + HexOf(blockHash));
+        return false;
+    }
+
+    Block block;
+    if (!mBlockData->ReadBlock(block, entry.blockPos)) {
+        MONEU_LOG_ERROR("ChainState: rollback cannot read block " +
+                        HexOf(blockHash) + " from disk");
+        return false;
+    }
+
+    BlockUndo undo;
+    if (!mBlockData->ReadBlockUndo(blockHash, undo)) {
+        MONEU_LOG_ERROR("ChainState: rollback has no undo data for block " +
+                        HexOf(blockHash));
+        return false;
+    }
+
+    if (!UndoBlockTwoPhase(block, undo)) {
+        MONEU_LOG_ERROR("ChainState: rollback failed for the block at "
+                        "height " + std::to_string(height));
+        return false;
+    }
+    return true;
+}
+
+bool ChainState::ReplayBlocksLocked()
+{
+    bytes32 markedNew, markedOld;
+    const bool haveMarker = mUTXOSet->GetHeadBlocks(markedNew, markedOld);
+
+    bytes32 target = mBestChain.blockHash;
+    bytes32 source = mUTXOSet->GetBestBlock();
+
+    if (haveMarker) {
+        source = markedOld;
+        MONEU_LOG_INFO("ChainState: an interrupted commit was recorded, "
+                       "from " + HexOf(markedOld) + " to " +
+                       HexOf(markedNew));
+    }
+
+    bool sourceUnset = true;
+    for (size_t i = 0; i < source.size(); ++i) {
+        if (source[i] != 0) { sourceUnset = false; break; }
+    }
+
+    if (!sourceUnset && source == target) {
+        if (haveMarker && !mUTXOSet->Flush()) return false;
+        return true;
+    }
+
+    const bytes32 genesisHash = NetParams::GetGenesisHash();
+    bytes32 fork = genesisHash;
+    std::vector<bytes32> rollback;
+
+    if (!sourceUnset) {
+        if (!LastCommonAncestorLocked(source, target, fork)) {
+            MONEU_LOG_ERROR("ChainState: replay found no common block "
+                            "between " + HexOf(source) + " and " +
+                            HexOf(target));
+            return false;
+        }
+        if (!AncestorPathLocked(source, fork, rollback)) {
+            MONEU_LOG_ERROR("ChainState: replay cannot walk back from " +
+                            HexOf(source) + " to " + HexOf(fork));
+            return false;
+        }
+    }
+
+    std::vector<bytes32> rollforward;
+    if (sourceUnset) {
+        bytes32 cursor = target;
+        const size_t maxSteps = static_cast<size_t>(mBestChain.height) + 2;
+        bool reached = false;
+        for (size_t step = 0; step < maxSteps; ++step) {
+            rollforward.push_back(cursor);
+            if (cursor == genesisHash) { reached = true; break; }
+            BlockIndexEntry entry;
+            if (!mBlockData->ReadBlockIndex(cursor, entry)) return false;
+            cursor = entry.hashPrev;
+        }
+        if (!reached) {
+            MONEU_LOG_ERROR("ChainState: replay cannot walk back from " +
+                            HexOf(target) + " to genesis");
+            return false;
+        }
+    } else if (!AncestorPathLocked(target, fork, rollforward)) {
+        MONEU_LOG_ERROR("ChainState: replay cannot walk back from " +
+                        HexOf(target) + " to " + HexOf(fork));
+        return false;
+    }
+
+    std::reverse(rollforward.begin(), rollforward.end());
+
+    MONEU_LOG_INFO("ChainState: replaying - " +
+                   std::to_string(rollback.size()) + " block(s) back, " +
+                   std::to_string(rollforward.size()) + " block(s) forward");
+
+    for (size_t i = 0; i < rollback.size(); ++i) {
+        BlockIndexEntry entry;
+        if (!mBlockData->ReadBlockIndex(rollback[i], entry)) return false;
+        if (!RollbackBlockLocked(rollback[i], entry.nHeight)) return false;
+    }
+
+    for (size_t i = 0; i < rollforward.size(); ++i) {
+        BlockIndexEntry entry;
+        if (!mBlockData->ReadBlockIndex(rollforward[i], entry)) return false;
+        if (!RollforwardBlockLocked(rollforward[i], entry.nHeight)) {
+            return false;
+        }
+    }
+
+    mUTXOSet->SetBestBlock(target);
+
+    if (!mUTXOSet->Flush()) {
+        MONEU_LOG_ERROR("ChainState: replay could not commit the UTXO set");
+        return false;
+    }
+
+    if (!(mUTXOSet->GetBestBlock() == target)) {
+        MONEU_LOG_ERROR("ChainState: replay ended at " +
+                        HexOf(mUTXOSet->GetBestBlock()) +
+                        " instead of the tip " + HexOf(target));
+        return false;
+    }
+
     return true;
 }
 
@@ -217,44 +457,18 @@ bool ChainState::ApplyBlockTwoPhase(const Block& block,
                                     BlockUndo* undoOut)
 {
     const auto& txs = block.GetTransactions();
-    const auto& reveals = block.GetReveals();
 
     BlockUndo local;
     BlockUndo& undo = undoOut ? *undoOut : local;
     undo.txUndo.clear();
-    undo.revealUndo.clear();
-    undo.expiryUndo.clear();
 
     bool coinbaseApplied = false;
-    std::vector<RevealUndo> settled;
-    std::vector<ExpiryUndo> released;
     std::vector<std::pair<size_t, std::vector<Coin> > > appliedHere;
 
     auto rollback = [&]() {
         for (size_t i = appliedHere.size(); i-- > 0; ) {
             mUTXOSet->UndoTransaction(txs[appliedHere[i].first],
                                       appliedHere[i].second);
-        }
-        for (size_t i = released.size(); i-- > 0; ) {
-            mUTXOSet->RestorePendingSpend(released[i].tx,
-                                          released[i].pendingHeight,
-                                          released[i].spentCoins,
-                                          released[i].fee);
-        }
-        for (size_t i = settled.size(); i-- > 0; ) {
-            const RevealUndo& ru = settled[i];
-            mUTXOSet->UnfinalizePendingSpend(ru.tx, ru.pendingHeight,
-                                             ru.spentCoins, ru.fee);
-            const std::vector<TxInput>& ins = ru.tx.GetInputs();
-            for (size_t r = 0; r < reveals.size(); ++r) {
-                if (!(reveals[r].GetTxid() == ru.txid)) continue;
-                const std::vector<NoiseProof>& pr = reveals[r].GetProofs();
-                for (size_t k = 0; k < ins.size() && k < pr.size(); ++k) {
-                    mUTXOSet->UnmarkNoiseLeafSpent(ins[k].GetKps(),
-                                                   pr[k].leafIndex);
-                }
-                break;
-            }
         }
         if (coinbaseApplied && !txs.empty()) {
             std::vector<Coin> none;
@@ -269,84 +483,6 @@ bool ChainState::ApplyBlockTwoPhase(const Block& block,
             return false;
         }
         coinbaseApplied = true;
-    }
-
-    if (!reveals.empty()) {
-        std::string why;
-        const validation::RevealValidation::BlockTxIndex blockTxs =
-            validation::RevealValidation::IndexBlockTransactions(
-                block.GetTransactions());
-        if (!validation::RevealValidation::CheckBlockReveals(
-                reveals, height, *mUTXOSet, why, &blockTxs)) {
-            std::cerr << "ChainState: reveal section rejected - "
-                      << why << "\n";
-            rollback();
-            return false;
-        }
-    }
-
-    for (size_t r = 0; r < reveals.size(); ++r) {
-        const LeafReveal& reveal = reveals[r];
-
-        PendingSpend pending;
-        if (!mUTXOSet->GetPendingSpend(reveal.GetTxid(), pending)) {
-            std::cerr << "ChainState: reveal " << r
-                      << " names no held transaction\n";
-            rollback();
-            return false;
-        }
-
-        RevealUndo ru;
-        ru.txid          = reveal.GetTxid();
-        ru.pendingHeight = pending.height;
-        ru.fee           = pending.fee;
-        ru.tx            = pending.tx;
-        ru.spentCoins    = pending.spentCoins;
-
-        if (!mUTXOSet->FinalizePendingSpend(reveal.GetTxid())) {
-            std::cerr << "ChainState: reveal " << r
-                      << " failed to settle\n";
-            rollback();
-            return false;
-        }
-
-        const std::vector<TxInput>& ins = pending.tx.GetInputs();
-        const std::vector<NoiseProof>& proofs = reveal.GetProofs();
-        for (size_t i = 0; i < ins.size() && i < proofs.size(); ++i) {
-            mUTXOSet->MarkNoiseLeafSpent(ins[i].GetKps(),
-                                         proofs[i].leafIndex);
-        }
-
-        settled.push_back(ru);
-        undo.revealUndo.push_back(ru);
-    }
-
-    if (height > NetParams::REVEAL_WINDOW_BLOCKS) {
-        const uint32_t expiring =
-            height - NetParams::REVEAL_WINDOW_BLOCKS - 1;
-        std::vector<bytes32> stale =
-            mUTXOSet->GetPendingSpendsAtHeight(expiring);
-        for (size_t i = 0; i < stale.size(); ++i) {
-            PendingSpend pending;
-            if (!mUTXOSet->GetPendingSpend(stale[i], pending)) continue;
-
-            ExpiryUndo eu;
-            eu.txid          = stale[i];
-            eu.pendingHeight = pending.height;
-            eu.fee           = pending.fee;
-            eu.tx            = pending.tx;
-            eu.spentCoins    = pending.spentCoins;
-
-            if (!mUTXOSet->ReleasePendingSpend(stale[i])) {
-                std::cerr << "ChainState: could not release an expired "
-                             "hold\n";
-                rollback();
-                return false;
-            }
-
-            released.push_back(eu);
-            undo.expiryUndo.push_back(eu);
-        }
     }
 
     for (size_t i = 0; i < txs.size(); ++i) {
@@ -428,7 +564,6 @@ bool ChainState::UndoBlockTwoPhase(const Block& block,
                                    const BlockUndo& undo)
 {
     const auto& txs = block.GetTransactions();
-    const auto& reveals = block.GetReveals();
 
     size_t nonCoinbaseCount = 0;
     for (size_t i = 0; i < txs.size(); ++i) {
@@ -447,53 +582,11 @@ bool ChainState::UndoBlockTwoPhase(const Block& block,
     for (size_t i = txs.size(); i-- > 0; ) {
         if (i == 0 && txs[i].IsCoinbase()) continue;
         --undoIndex;
-        mUTXOSet->ReleasePendingSpend(txs[i].GetHash());
         if (!mUTXOSet->UndoTransaction(txs[i],
                                        undo.txUndo[undoIndex].spentCoins)) {
             std::cerr << "ChainState: could not undo transaction "
                       << i << "\n";
             return false;
-        }
-    }
-
-    for (size_t i = undo.expiryUndo.size(); i-- > 0; ) {
-        const ExpiryUndo& eu = undo.expiryUndo[i];
-        if (!mUTXOSet->RestorePendingSpend(eu.tx, eu.pendingHeight,
-                                           eu.spentCoins, eu.fee)) {
-            std::cerr << "ChainState: could not restore an expired hold\n";
-            return false;
-        }
-    }
-
-    for (size_t r = reveals.size(); r-- > 0; ) {
-        const LeafReveal& reveal = reveals[r];
-
-        const RevealUndo* ru = NULL;
-        for (size_t k = 0; k < undo.revealUndo.size(); ++k) {
-            if (undo.revealUndo[k].txid == reveal.GetTxid()) {
-                ru = &undo.revealUndo[k];
-                break;
-            }
-        }
-        if (ru == NULL) {
-            std::cerr << "ChainState: no undo record for reveal " << r
-                      << "\n";
-            return false;
-        }
-
-        const Transaction& heldTx = ru->tx;
-
-        if (!mUTXOSet->UnfinalizePendingSpend(heldTx, ru->pendingHeight,
-                                              ru->spentCoins, ru->fee)) {
-            std::cerr << "ChainState: could not take back a settlement\n";
-            return false;
-        }
-
-        const std::vector<TxInput>& ins = heldTx.GetInputs();
-        const std::vector<NoiseProof>& proofs = reveal.GetProofs();
-        for (size_t i = 0; i < ins.size() && i < proofs.size(); ++i) {
-            mUTXOSet->UnmarkNoiseLeafSpent(ins[i].GetKps(),
-                                           proofs[i].leafIndex);
         }
     }
 
@@ -738,10 +831,16 @@ bool ChainState::ConnectBlockLocked(const Block& block)
     }
     mUTXOSet->SetBestBlock(blockHash);
 
+    if (!mUTXOSet->Flush()) {
+        MONEU_LOG_ERROR("ChainState: the block at height " +
+                        std::to_string(newHeight) + " is connected but the "
+                        "UTXO set could not be committed; it will be "
+                        "replayed at the next start");
+    }
+
     MONEU_LOG_INFO("UpdateTip: new best=" + HexOf(blockHash) +
                    " height=" + std::to_string(newHeight) +
                    " tx=" + std::to_string(block.GetTransactionCount()) +
-                   " reveals=" + std::to_string(block.GetRevealCount()) +
                    " date='" + TimeOf(hdr.GetTimestamp()) + "'" +
                    " work=" + HexOf(chainWork).substr(40));
 
@@ -821,6 +920,12 @@ bool ChainState::DisconnectTipLocked()
 
     mDB->Write(DB_CHAIN_BEST, mBestChain);
     mUTXOSet->SetBestBlock(mBestChain.blockHash);
+
+    if (!mUTXOSet->Flush()) {
+        MONEU_LOG_ERROR("ChainState: the tip was disconnected but the UTXO "
+                        "set could not be committed at height " +
+                        std::to_string(mBestChain.height));
+    }
 
     QueueDisconnectedLocked(block);
     return true;

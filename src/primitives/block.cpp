@@ -51,7 +51,7 @@ BlockHeader::BlockHeader()
 {
     mPrevBlockHash.fill(0);
     mMerkleRoot.fill(0);
-    mRevealRoot.fill(0);
+    mLeafRoot.fill(0);
     mBlockHash.fill(0);
 }
 
@@ -65,7 +65,7 @@ BlockHeader::BlockHeader(uint32_t version)
 {
     mPrevBlockHash.fill(0);
     mMerkleRoot.fill(0);
-    mRevealRoot.fill(0);
+    mLeafRoot.fill(0);
     mBlockHash.fill(0);
 }
 
@@ -110,7 +110,7 @@ std::vector<uint8_t> BlockHeader::Serialize() const {
     WriteLE32(data, mVersion);
     data.insert(data.end(), mPrevBlockHash.begin(), mPrevBlockHash.end());
     data.insert(data.end(), mMerkleRoot.begin(), mMerkleRoot.end());
-    data.insert(data.end(), mRevealRoot.begin(), mRevealRoot.end());
+    data.insert(data.end(), mLeafRoot.begin(), mLeafRoot.end());
     WriteLE64(data, mTimestamp);
     WriteLE32(data, mHeight);
     WriteLE32(data, mBits);
@@ -136,7 +136,7 @@ bool BlockHeader::SerializeTo(uint8_t* out, size_t outLen) const {
     put32(mVersion);
     put32b(mPrevBlockHash);
     put32b(mMerkleRoot);
-    put32b(mRevealRoot);
+    put32b(mLeafRoot);
     put64(mTimestamp);
     put32(mHeight);
     put32(mBits);
@@ -156,7 +156,7 @@ BlockHeader BlockHeader::Deserialize(const uint8_t* data, size_t len) {
     offset += 32;
     std::memcpy(header.mMerkleRoot.data(), data + offset, 32);
     offset += 32;
-    std::memcpy(header.mRevealRoot.data(), data + offset, 32);
+    std::memcpy(header.mLeafRoot.data(), data + offset, 32);
     offset += 32;
     header.mTimestamp = ReadLE64(data, offset);
     header.mHeight = ReadLE32(data, offset);
@@ -208,17 +208,6 @@ void Block::ClearTransactions() {
     mTransactions.clear();
 }
 
-void Block::AddReveal(const LeafReveal& reveal) {
-    if (mReveals.size() >= MAX_REVEALS) {
-        throw CryptoError("Block reveal limit exceeded");
-    }
-    mReveals.push_back(reveal);
-}
-
-void Block::ClearReveals() {
-    mReveals.clear();
-}
-
 bytes32 ComputeMerkleRoot(const std::vector<bytes32>& hashes) {
     if (hashes.empty()) {
         bytes32 zero;
@@ -262,17 +251,32 @@ void Block::UpdateMerkleRoot() {
     mHeader.SetMerkleRoot(ComputeMerkleRoot());
 }
 
-bytes32 Block::ComputeRevealRoot() const {
-    return MONEU::ComputeRevealRoot(mReveals);
+bytes32 Block::ComputeLeafRoot() const {
+    std::vector<bytes32> leafCommitments;
+    for (const auto& tx : mTransactions) {
+        if (tx.IsCoinbase()) continue;
+        for (const auto& input : tx.GetInputs()) {
+            const std::vector<uint8_t>& proof = input.GetNoiseProof();
+            if (proof.empty()) continue;
+            SHA256_CTX ctx;
+            sha256_Init(&ctx);
+            sha256_Update(&ctx, input.GetKps().data(), 32);
+            sha256_Update(&ctx, proof.data(), proof.size());
+            bytes32 h;
+            sha256_Final(&ctx, h.data());
+            leafCommitments.push_back(h);
+        }
+    }
+    return MONEU::ComputeMerkleRoot(leafCommitments);
 }
 
-void Block::UpdateRevealRoot() {
-    mHeader.SetRevealRoot(ComputeRevealRoot());
+void Block::UpdateLeafRoot() {
+    mHeader.SetLeafRoot(ComputeLeafRoot());
 }
 
 void Block::UpdateRoots() {
     UpdateMerkleRoot();
-    UpdateRevealRoot();
+    UpdateLeafRoot();
 }
 
 bool Block::IsCoinbaseValid() const {
@@ -288,12 +292,8 @@ bool Block::IsValid() const {
     if (!mHeader.IsValid()) return false;
     if (mTransactions.empty()) return false;
     if (!IsCoinbaseValid()) return false;
-    if (mReveals.size() > MAX_REVEALS) return false;
     if (!(ComputeMerkleRoot() == mHeader.GetMerkleRoot())) return false;
-    if (!(ComputeRevealRoot() == mHeader.GetRevealRoot())) return false;
-    for (const auto& reveal : mReveals) {
-        if (!reveal.IsWellFormed()) return false;
-    }
+    if (!(ComputeLeafRoot() == mHeader.GetLeafRoot())) return false;
     if (GetSerializedSize() > NetParams::MAX_BLOCK_SIZE) return false;
     bytes32 computedMerkle = ComputeMerkleRoot();
     if (computedMerkle != mHeader.GetMerkleRoot()) return false;
@@ -310,11 +310,6 @@ size_t Block::GetSerializedSize() const {
         size += 4;
         size += tx.GetSerializedSize();
     }
-    size += 4;
-    for (const auto& reveal : mReveals) {
-        size += 4;
-        size += reveal.GetSerializedSize();
-    }
     return size;
 }
 
@@ -328,12 +323,6 @@ std::vector<uint8_t> Block::Serialize() const {
         std::vector<uint8_t> txData = tx.Serialize();
         WriteLE32(data, static_cast<uint32_t>(txData.size()));
         data.insert(data.end(), txData.begin(), txData.end());
-    }
-    WriteLE32(data, static_cast<uint32_t>(mReveals.size()));
-    for (const auto& reveal : mReveals) {
-        std::vector<uint8_t> revealData = reveal.Serialize();
-        WriteLE32(data, static_cast<uint32_t>(revealData.size()));
-        data.insert(data.end(), revealData.begin(), revealData.end());
     }
     return data;
 }
@@ -364,31 +353,6 @@ Block Block::Deserialize(const uint8_t* data, size_t len) {
         offset += txLen;
     }
 
-    if (offset + 4 > len) {
-        return block;
-    }
-    uint32_t revealCount = ReadLE32(data, offset);
-    if (revealCount > MAX_REVEALS) {
-        throw CryptoError("Block reveal count implausible");
-    }
-    block.mReveals.reserve(revealCount);
-    for (uint32_t i = 0; i < revealCount; i++) {
-        if (offset + 4 > len) {
-            throw CryptoError("Block truncated at reveal length");
-        }
-        uint32_t revealLen = ReadLE32(data, offset);
-        if (revealLen == 0 || offset + revealLen > len) {
-            throw CryptoError("Block truncated inside reveal");
-        }
-        size_t inner = 0;
-        LeafReveal reveal =
-            LeafReveal::Deserialize(data + offset, revealLen, inner);
-        if (inner != revealLen) {
-            throw CryptoError("Block reveal length mismatch");
-        }
-        offset += revealLen;
-        block.mReveals.push_back(reveal);
-    }
     return block;
 }
 
@@ -464,11 +428,6 @@ BlockBuilder& BlockBuilder::AddCoinbase(const Transaction& coinbase) {
         throw CryptoError("Coinbase must be the first transaction");
     }
     mBlock.AddTransaction(coinbase);
-    return *this;
-}
-
-BlockBuilder& BlockBuilder::AddReveal(const LeafReveal& reveal) {
-    mBlock.AddReveal(reveal);
     return *this;
 }
 

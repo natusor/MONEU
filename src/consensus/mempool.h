@@ -5,7 +5,6 @@
 #define MONEU_CONSENSUS_MEMPOOL_H
 
 #include "../primitives/transaction.h"
-#include "../primitives/leaf_reveal.h"
 #include "../chainparams.h"
 #include <map>
 #include <unordered_map>
@@ -99,16 +98,6 @@ private:
     std::unordered_map<std::string, std::string> mSpends; // outpoint -> tx hash
     std::unordered_map<std::string, std::string> mLeafSpends; // leaf -> tx hash
 
-    // Reveals waiting to go into a block, keyed by the transaction they
-    // settle. One transaction is settled once, so one entry per txid is
-    // all that can ever be useful.
-    //
-    // These are kept apart from transactions on purpose. A reveal pays no
-    // fee of its own - the fee was set by the transaction it settles - so
-    // it has no place in a fee-ordered queue, and it must never be
-    // displaced by one. A held spend that loses its reveal to eviction
-    // would expire and the payment would simply fail.
-    std::map<std::string, LeafReveal> mReveals;
 
     uint64_t mSequenceCounter;
     size_t   mMaxBytes;
@@ -196,10 +185,8 @@ public:
         Transaction tx;
         int64_t     fee;
         int64_t     entryTime;
-        bool        hasReveal;
-        LeafReveal  reveal;
 
-        PersistedEntry() : fee(0), entryTime(0), hasReveal(false) {}
+        PersistedEntry() : fee(0), entryTime(0) {}
     };
 
     // Snapshot of everything the pool holds, in admission order.
@@ -289,28 +276,6 @@ public:
     // (0 when the pool is not under pressure).
     int64_t GetMinFeeRate() const;
 
-    // Admit a reveal for relay and block assembly. The caller validates it
-    // against the chain first, exactly as it does for transactions.
-    // Returns false if one for the same transaction is already waiting.
-    bool AddReveal(const LeafReveal& reveal);
-
-    bool HasReveal(const bytes32& txid) const;
-    bool GetReveal(LeafReveal& out, const bytes32& txid) const;
-    bool RemoveReveal(const bytes32& txid);
-
-    // Snapshot for block assembly, capped at maxCount.
-    std::vector<LeafReveal> GetReveals(size_t maxCount) const;
-
-    // Drop every reveal a connected block settled. Call alongside
-    // RemoveForBlock.
-    void RemoveRevealsForBlock(const std::vector<LeafReveal>& blockReveals);
-
-    // Drop reveals whose transaction is no longer waiting - it either
-    // settled or its window closed. Called with the set of txids that are
-    // still held, so anything else goes.
-    size_t DropRevealsNotHeld(const std::vector<bytes32>& stillHeld);
-
-    size_t RevealCount() const;
 
     size_t Size() const;
     size_t SizeBytes() const;

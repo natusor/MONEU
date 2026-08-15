@@ -838,49 +838,6 @@ bool WalletManager::HasNoiseFile() const {
 }
 
 namespace {
-std::string TxidKey(const bytes32& txid) {
-    return std::string(reinterpret_cast<const char*>(txid.data()), 32);
-}
-}
-
-bool WalletManager::BuildReveal(LeafReveal& out,
-                                const bytes32& txid,
-                                uint32_t height) const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    auto it = mPreparedProofs.find(TxidKey(txid));
-    if (it == mPreparedProofs.end() || it->second.empty()) return false;
-
-    LeafReveal reveal(txid, height);
-    for (size_t i = 0; i < it->second.size(); ++i) {
-        reveal.AddProof(it->second[i]);
-    }
-    out = reveal;
-    return true;
-}
-
-std::vector<bytes32> WalletManager::GetPreparedRevealTxids() const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    std::vector<bytes32> out;
-    out.reserve(mPreparedProofs.size());
-    for (const auto& entry : mPreparedProofs) {
-        if (entry.first.size() != 32) continue;
-        bytes32 txid;
-        std::memcpy(txid.data(), entry.first.data(), 32);
-        out.push_back(txid);
-    }
-    return out;
-}
-
-bool WalletManager::DropPreparedReveal(const bytes32& txid) {
-    std::lock_guard<std::mutex> lock(mMutex);
-    if (mPreparedProofs.erase(TxidKey(txid)) == 0) return false;
-    SaveToFile();
-    return true;
-}
-
-size_t WalletManager::PreparedRevealCount() const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    return mPreparedProofs.size();
 }
 
 uint32_t WalletManager::SyncNoiseLeafPointer(
@@ -1035,16 +992,7 @@ bool WalletManager::SaveToFile() const {
     put(&mNextChangeIndex, sizeof(mNextChangeIndex));
     put32(mNoiseNextLeaf);
 
-    put32(static_cast<uint32_t>(mPreparedProofs.size()));
-    for (const auto& entry : mPreparedProofs) {
-        put(entry.first.data(), 32);
-        put32(static_cast<uint32_t>(entry.second.size()));
-        for (size_t i = 0; i < entry.second.size(); ++i) {
-            const std::vector<uint8_t> blob = entry.second[i].Serialize();
-            put32(static_cast<uint32_t>(blob.size()));
-            put(blob.data(), blob.size());
-        }
-    }
+    put32(0);
 
     const std::string tmpFile = mWalletFile.string() + ".tmp";
 
@@ -1211,14 +1159,13 @@ bool WalletManager::LoadFromFile() {
             "Invalid wallet file - noise leaf pointer out of range");
     }
 
-    mPreparedProofs.clear();
     uint32_t preparedCount = 0;
     file.read(reinterpret_cast<char*>(&preparedCount),
               sizeof(preparedCount));
-    if (file.good()) {
+    if (file.good() && preparedCount > 0) {
         if (preparedCount > MAX_ADDRESSES) {
             throw WalletError(
-                "Invalid wallet file - prepared reveal count implausible");
+                "Invalid wallet file - stored record count implausible");
         }
         for (uint32_t i = 0; i < preparedCount; ++i) {
             char key[32];
@@ -1226,27 +1173,19 @@ bool WalletManager::LoadFromFile() {
             uint32_t proofCount = 0;
             file.read(reinterpret_cast<char*>(&proofCount),
                       sizeof(proofCount));
-            if (proofCount == 0 || proofCount > Transaction::MAX_INPUTS) {
+            if (!file.good()) break;
+            if (proofCount > NetParams::NOISE_LEAF_COUNT_VALUE) {
                 throw WalletError(
-                    "Invalid wallet file - prepared proof count implausible");
+                    "Invalid wallet file - stored proof count implausible");
             }
-            std::vector<NoiseProof> proofs;
-            proofs.reserve(proofCount);
             for (uint32_t k = 0; k < proofCount; ++k) {
                 uint32_t blobLen = 0;
                 file.read(reinterpret_cast<char*>(&blobLen),
                           sizeof(blobLen));
-                if (blobLen == 0 || blobLen > (1u << 20)) {
-                    throw WalletError(
-                        "Invalid wallet file - prepared proof size bad");
-                }
-                std::vector<uint8_t> blob(blobLen);
-                file.read(reinterpret_cast<char*>(blob.data()), blobLen);
-                size_t off = 0;
-                proofs.push_back(
-                    NoiseProof::Deserialize(blob.data(), blob.size(), off));
+                if (!file.good()) break;
+                file.seekg(static_cast<std::streamoff>(blobLen),
+                           std::ios::cur);
             }
-            mPreparedProofs[std::string(key, 32)] = proofs;
         }
     }
 

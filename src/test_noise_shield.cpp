@@ -6,11 +6,9 @@
 
 #include "storage/utxo_set.h"
 #include "storage/chain_state.h"
-#include "primitives/leaf_reveal.h"
 #include "consensus/pow.h"
 #include "chainparams.h"
 #include "primitives/block.h"
-#include "validation/reveal_validation.h"
 #include "validation/tx_validation.h"
 #include "validation/block_validation.h"
 #include "consensus/mempool.h"
@@ -86,25 +84,6 @@ static Transaction MakeSpendTx(const bytes32& prevTxHash,
 
 // Two-block model: a transaction reaches its block carrying no proof at
 // all. The leaves that authorise it are published later, by a reveal.
-static Transaction MakeBareTx(const bytes32& prevTxHash,
-                              uint32_t prevIndex,
-                              const bytes32& kps,
-                              const bytes32& destPubkeyHash,
-                              int64_t value,
-                              uint8_t pubkeyTag = 0xE1) {
-    Transaction tx;
-    TxInput input;
-    input.SetPrevTxHash(prevTxHash);
-    input.SetOutputIndex(prevIndex);
-    input.SetPubkey(FillHash(pubkeyTag));
-    bytes64 sig;
-    sig.fill(0xE2);
-    input.SetSignature(sig);
-    input.SetKps(kps);
-    tx.AddInput(input);
-    tx.AddOutput(TxOutput(value, destPubkeyHash));
-    return tx;
-}
 
 // Rebind an existing proof's leaf to a different transaction.
 static Transaction RebindLeaf(const Transaction& source,
@@ -359,225 +338,6 @@ int main() {
               "a proof from a moved pool still verifies");
     }
 
-    // LeafReveal: the record that publishes a transaction's leaves in a
-    // later block. Stage one of the two-block model - serialization and
-    // parsing only, no consensus behaviour yet.
-    {
-        std::vector<uint8_t> raw(256 * 32);
-        for (size_t i = 0; i < raw.size(); ++i) {
-            raw[i] = static_cast<uint8_t>((i * 17 + 3) & 0xFF);
-        }
-        NoiseFile pool = NoiseFile::Generate(raw, 256);
-
-        bytes32 txid = FillHash(0x91);
-        LeafReveal reveal(txid, 4200);
-        for (int i = 0; i < 3; ++i) {
-            reveal.AddProof(pool.CreateProof(txid));
-        }
-
-        Check(reveal.GetProofCount() == 3, "reveal holds three proofs");
-        Check(reveal.IsWellFormed(), "a normal reveal is well formed");
-
-        // Round trip.
-        std::vector<uint8_t> blob = reveal.Serialize();
-        Check(blob.size() == reveal.GetSerializedSize(),
-              "serialized size matches the declared size");
-
-        size_t off = 0;
-        LeafReveal back = LeafReveal::Deserialize(blob.data(), blob.size(), off);
-        Check(off == blob.size(), "parsing consumes the whole record");
-        Check(back.GetTxid() == txid, "txid survives the round trip");
-        Check(back.GetHeight() == 4200, "height survives the round trip");
-        Check(back.GetProofCount() == 3, "proof count survives the round trip");
-        Check(back.GetHash() == reveal.GetHash(),
-              "hash is stable across the round trip");
-
-        // The hash must cover the proofs. This is what a block header can
-        // commit to, which the transaction merkle root never could.
-        LeafReveal fewer(txid, 4200);
-        fewer.AddProof(reveal.GetProofs()[0]);
-        Check(!(fewer.GetHash() == reveal.GetHash()),
-              "dropping a proof changes the reveal hash");
-
-        LeafReveal otherHeight(txid, 4201);
-        for (size_t i = 0; i < reveal.GetProofs().size(); ++i) {
-            otherHeight.AddProof(reveal.GetProofs()[i]);
-        }
-        Check(!(otherHeight.GetHash() == reveal.GetHash()),
-              "changing the height changes the reveal hash");
-
-        // Adversarial input: every one of these arrives from the network.
-        bool threw = false;
-        try { size_t o = 0; LeafReveal::Deserialize(blob.data(), 10, o); }
-        catch (const std::exception&) { threw = true; }
-        Check(threw, "a truncated record is rejected");
-
-        threw = false;
-        try {
-            std::vector<uint8_t> bad = blob;
-            bad[32 + 4] = 0xFF; bad[32 + 5] = 0xFF;
-            bad[32 + 6] = 0xFF; bad[32 + 7] = 0xFF;   // proof count = 2^32-1
-            size_t o = 0;
-            LeafReveal::Deserialize(bad.data(), bad.size(), o);
-        } catch (const std::exception&) { threw = true; }
-        Check(threw, "an absurd proof count is rejected before allocating");
-
-        threw = false;
-        try {
-            std::vector<uint8_t> bad = blob;
-            bad[32 + 4] = 0; bad[32 + 5] = 0;
-            bad[32 + 6] = 0; bad[32 + 7] = 0;          // proof count = 0
-            size_t o = 0;
-            LeafReveal::Deserialize(bad.data(), bad.size(), o);
-        } catch (const std::exception&) { threw = true; }
-        Check(threw, "a reveal carrying no proofs is rejected");
-
-        threw = false;
-        try {
-            std::vector<uint8_t> bad = blob;
-            bad[32 + 8] = 0xFF; bad[32 + 9] = 0xFF;    // first proof length
-            size_t o = 0;
-            LeafReveal::Deserialize(bad.data(), bad.size(), o);
-        } catch (const std::exception&) { threw = true; }
-        Check(threw, "a proof length running past the record is rejected");
-
-        // The same leaf twice inside one record would consume a
-        // single-use value twice.
-        LeafReveal doubled(txid, 4200);
-        doubled.AddProof(reveal.GetProofs()[0]);
-        doubled.AddProof(reveal.GetProofs()[0]);
-        Check(!doubled.IsWellFormed(), "a repeated leaf is not well formed");
-
-        LeafReveal zeroTxid(FillHash(0x00), 4200);
-        zeroTxid.AddProof(reveal.GetProofs()[0]);
-        Check(!zeroTxid.IsWellFormed(), "an all-zero txid is not well formed");
-
-        // Reveal root, the value a block header will commit to.
-        std::vector<LeafReveal> none;
-        bytes32 emptyRoot = ComputeRevealRoot(none);
-        Check(emptyRoot == FillHash(0x00),
-              "a block with no reveals has a zero reveal root");
-
-        std::vector<LeafReveal> one;
-        one.push_back(reveal);
-        Check(ComputeRevealRoot(one) == reveal.GetHash(),
-              "a single reveal is its own root");
-
-        std::vector<LeafReveal> two;
-        two.push_back(reveal);
-        two.push_back(fewer);
-        bytes32 rootTwo = ComputeRevealRoot(two);
-        Check(!(rootTwo == reveal.GetHash()),
-              "two reveals produce a combined root");
-
-        std::vector<LeafReveal> swapped;
-        swapped.push_back(fewer);
-        swapped.push_back(reveal);
-        Check(!(ComputeRevealRoot(swapped) == rootTwo),
-              "reveal order is committed to by the root");
-    }
-
-    // Held spends: the state a transaction sits in between reaching a block
-    // and having its leaves published. Stage two of the two-block model.
-    {
-        storage::UTXOSet held(dataDir / "held", 1 << 20);
-
-        bytes32 owner = FillHash(0x41);
-        bytes32 dest  = FillHash(0x42);
-        OutPoint opA(FillHash(0x51), 0);
-        OutPoint opB(FillHash(0x52), 0);
-        Check(held.AddCoin(opA, Coin(500000, owner, 1, false)), "coin A added");
-        Check(held.AddCoin(opB, Coin(500000, owner, 1, false)), "coin B added");
-
-        std::vector<uint8_t> raw(64 * 32);
-        for (size_t i = 0; i < raw.size(); ++i) {
-            raw[i] = static_cast<uint8_t>((i * 19 + 2) & 0xFF);
-        }
-        NoiseFile hp = NoiseFile::Generate(raw, 64);
-        bytes32 hkps = hp.GetRoot();
-
-        Transaction t1 = MakeSpendTx(opA.txHash, 0, hp, hkps, dest, 400000);
-        Coin heldCoin;
-        Check(held.GetCoin(opA, heldCoin), "coin A readable before the hold");
-        std::vector<Coin> spent;
-        spent.push_back(heldCoin);
-
-        // Holding must not touch the coin. The spend has not happened yet.
-        Check(held.AddPendingSpend(t1, 10, spent, 1000), "spend held at height 10");
-        Check(held.PendingSpendCount() == 1, "one spend awaiting its leaves");
-        Check(held.GetCoin(opA, heldCoin),
-              "the held coin is still unspent, the spend has not happened");
-        Coin ghost;
-        Check(!held.GetCoin(OutPoint(t1.GetHash(), 0), ghost),
-              "the transaction's outputs do not exist yet");
-        bytes32 holder;
-        Check(held.IsOutpointPending(opA, &holder) && holder == t1.GetHash(),
-              "the output reports which transaction holds it");
-        Check(!held.IsOutpointPending(opB),
-              "an untouched output is not held");
-
-        // A second transaction naming the same output must be refused,
-        // otherwise two spends would queue on one coin.
-        Transaction t2 = MakeSpendTx(opA.txHash, 0, hp, hkps,
-                                     FillHash(0x43), 300000);
-        std::vector<Coin> spent2;
-        spent2.push_back(heldCoin);
-        Check(!held.AddPendingSpend(t2, 10, spent2, 1000),
-              "a second spend of a held output is refused");
-        Check(held.PendingSpendCount() == 1, "the refusal changed nothing");
-
-        // Holding survives a restart: a node that forgot would settle
-        // nothing and would let the held output be taken by someone else.
-        Check(held.Flush(), "state flushed");
-        storage::PendingSpend reloaded;
-        Check(held.GetPendingSpend(t1.GetHash(), reloaded),
-              "the held spend is readable after the flush");
-        Check(reloaded.height == 10, "its height survived");
-        Check(reloaded.fee == 1000, "its fee survived");
-        Check(reloaded.spentCoins.size() == 1 &&
-              reloaded.spentCoins[0].value == 500000,
-              "the coin it holds survived");
-
-        std::vector<bytes32> atTen = held.GetPendingSpendsAtHeight(10);
-        Check(atTen.size() == 1 && atTen[0] == t1.GetHash(),
-              "spends can be found by the height that carried them");
-        Check(held.GetPendingSpendsAtHeight(11).empty(),
-              "no spends are waiting from a height that carried none");
-
-        // Settlement: the leaves arrived. Now the spend happens.
-        Check(held.FinalizePendingSpend(t1.GetHash()), "spend settled");
-        Check(!held.GetCoin(opA, ghost), "the input is gone after settlement");
-        Check(held.GetCoin(OutPoint(t1.GetHash(), 0), ghost),
-              "the outputs exist after settlement");
-        Check(ghost.value == 400000, "the output carries the right value");
-        Check(held.PendingSpendCount() == 0, "nothing is awaiting leaves");
-        Check(!held.IsOutpointPending(opA), "the hold is gone");
-
-        // Release: the other path out. Used when the block that carried the
-        // transaction is disconnected, and when the reveal window closes.
-        Transaction t3 = MakeSpendTx(opB.txHash, 0, hp, hkps, dest, 400000);
-        Coin coinB;
-        held.GetCoin(opB, coinB);
-        std::vector<Coin> spentB;
-        spentB.push_back(coinB);
-        Check(held.AddPendingSpend(t3, 11, spentB, 1000), "second spend held");
-        Check(held.ReleasePendingSpend(t3.GetHash()), "spend released");
-        Check(held.PendingSpendCount() == 0, "nothing left waiting");
-        Check(held.GetCoin(opB, coinB) && coinB.value == 500000,
-              "the released coin is untouched and spendable again");
-        Check(!held.GetCoin(OutPoint(t3.GetHash(), 0), ghost),
-              "a released spend created no outputs");
-
-        // And the output can now be held by a different transaction.
-        Transaction t4 = MakeSpendTx(opB.txHash, 0, hp, hkps,
-                                     FillHash(0x44), 350000);
-        std::vector<Coin> spentB2;
-        spentB2.push_back(coinB);
-        Check(held.AddPendingSpend(t4, 12, spentB2, 1000),
-              "a released output can be held by another spend");
-        Check(held.ReleasePendingSpend(t4.GetHash()), "cleanup");
-    }
-
     // Genesis block. ChainState rebuilds block 0 from BuildGenesisBlock()
     // at start-up and refuses to run if it does not match the hardcoded
     // hash, so a change to any genesis constant that was not carried
@@ -615,190 +375,9 @@ int main() {
 
     // Reveal validation: the rules that decide whether a published set of
     // leaves may settle a held spend. Stage three of the two-block model.
-    {
-        using validation::RevealValidation;
-        using validation::RevealResult;
-
-        storage::UTXOSet rv(dataDir / "reveal", 1 << 20);
-
-        bytes32 owner = FillHash(0x61);
-        bytes32 dest  = FillHash(0x62);
-        OutPoint opX(FillHash(0x71), 0);
-        OutPoint opY(FillHash(0x72), 0);
-        rv.AddCoin(opX, Coin(500000, owner, 1, false));
-        rv.AddCoin(opY, Coin(500000, owner, 1, false));
-
-        std::vector<uint8_t> raw(NetParams::NOISE_FILE_BYTES);
-        for (size_t i = 0; i < raw.size(); ++i) {
-            raw[i] = static_cast<uint8_t>((i * 23 + 9) & 0xFF);
-        }
-        NoiseFile pool = NoiseFile::Generate(raw, NetParams::NOISE_LEAF_COUNT);
-        bytes32 pkps = pool.GetRoot();
-
-        // Held at height 100.
-        Transaction bare = MakeBareTx(opX.txHash, 0, pkps, dest, 400000);
-        Coin cx; rv.GetCoin(opX, cx);
-        std::vector<Coin> sx; sx.push_back(cx);
-        Check(rv.AddPendingSpend(bare, 100, sx, 1000), "transaction held at 100");
-
-        LeafReveal good(bare.GetHash(), 100);
-        good.AddProof(pool.CreateProof(bare.GetHash()));
-
-        std::string why;
-        Check(RevealValidation::CheckReveal(good, 101, rv, why) ==
-              RevealResult::VALID,
-              "a correct reveal in the next block is accepted");
-
-        // Its own block is now allowed. A spend and the leaves that
-        // authorise it travel together, so a payment settles in one block
-        // instead of two. What remains barred is a later block: a reveal
-        // still cannot reach forward to a transaction that does not exist
-        // yet.
-        Check(RevealValidation::CheckReveal(good, 100, rv, why) ==
-              RevealResult::VALID,
-              "a reveal settles a transaction from its own block");
-        Check(RevealValidation::CheckReveal(good, 99, rv, why) ==
-              RevealResult::NOT_YET_ELIGIBLE,
-              "a reveal cannot settle a transaction from a later block");
-
-        // Window edges.
-        Check(RevealValidation::CheckReveal(good, 106, rv, why) ==
-              RevealResult::VALID,
-              "the last block of the window still accepts the reveal");
-        Check(RevealValidation::CheckReveal(good, 107, rv, why) ==
-              RevealResult::WINDOW_EXPIRED,
-              "one block past the window the reveal is refused");
-        Check(RevealValidation::ExpiryHeight(100) == 107,
-              "spends held at 100 are released at 107");
-
-        // A reveal naming the wrong position cannot be replayed.
-        LeafReveal wrongHeight(bare.GetHash(), 99);
-        wrongHeight.AddProof(good.GetProofs()[0]);
-        Check(RevealValidation::CheckReveal(wrongHeight, 101, rv, why) ==
-              RevealResult::HEIGHT_MISMATCH,
-              "a reveal naming the wrong height is refused");
-
-        LeafReveal unknown(FillHash(0x7F), 100);
-        unknown.AddProof(good.GetProofs()[0]);
-        Check(RevealValidation::CheckReveal(unknown, 101, rv, why) ==
-              RevealResult::UNKNOWN_TRANSACTION,
-              "a reveal for no held transaction is refused");
-
-        LeafReveal tooMany(bare.GetHash(), 100);
-        tooMany.AddProof(good.GetProofs()[0]);
-        tooMany.AddProof(pool.CreateProof(bare.GetHash()));
-        Check(RevealValidation::CheckReveal(tooMany, 101, rv, why) ==
-              RevealResult::PROOF_COUNT_MISMATCH,
-              "a reveal with more proofs than inputs is refused");
-
-        // A proof bound to a different transaction must not verify.
-        LeafReveal wrongBind(bare.GetHash(), 100);
-        NoiseProof otherBound = pool.CreateProof(FillHash(0x7E));
-        wrongBind.AddProof(otherBound);
-        Check(RevealValidation::CheckReveal(wrongBind, 101, rv, why) ==
-              RevealResult::INVALID_PROOF,
-              "a proof bound to another transaction does not verify");
-
-        Transaction second = MakeBareTx(opY.txHash, 0, pkps,
-                                          FillHash(0x63), 400000, 0xEE);
-        Coin cy; rv.GetCoin(opY, cy);
-        std::vector<Coin> sy; sy.push_back(cy);
-        Check(rv.AddPendingSpend(second, 101, sy, 1000),
-              "spend held at 101");
-
-        NoiseProof taken = good.GetProofs()[0];
-        NoiseProof rebound = taken;
-        rebound.boundProof = BindLeafToTx(taken.leaf, second.GetHash());
-
-        LeafReveal reused(second.GetHash(), 101);
-        reused.AddProof(rebound);
-
-        Check(NoiseFile::VerifyProof(pkps, second.GetHash(), rebound,
-                                     NetParams::NOISE_LEAF_COUNT),
-              "rebound proof verifies");
-
-        Check(RevealValidation::CheckReveal(reused, 101, rv, why) ==
-              RevealResult::VALID,
-              "reveal accepted");
-
-        rv.MarkNoiseLeafSpent(pkps, taken.leafIndex);
-        Check(RevealValidation::CheckReveal(reused, 102, rv, why) ==
-              RevealResult::LEAF_ALREADY_SPENT,
-              "consumed leaf refused");
-
-        // Block-level checks.
-        std::vector<LeafReveal> twice;
-        twice.push_back(good);
-        twice.push_back(good);
-        Check(!RevealValidation::CheckBlockReveals(twice, 101, rv, why),
-              "a block settling one transaction twice is refused");
-
-        std::vector<LeafReveal> single;
-        single.push_back(good);
-        Check(!RevealValidation::CheckBlockReveals(single, 101, rv, why),
-              "a reveal whose leaf was consumed meanwhile is refused");
-    }
 
     // Mempool reveal queue: stage six of the two-block model. Reveals sit
     // in their own queue, never competing with transactions for space.
-    {
-        Mempool pool(1 << 20);
-
-        std::vector<uint8_t> raw(64 * 32);
-        for (size_t i = 0; i < raw.size(); ++i) {
-            raw[i] = static_cast<uint8_t>((i * 29 + 4) & 0xFF);
-        }
-        NoiseFile np = NoiseFile::Generate(raw, 64);
-
-        bytes32 t1 = FillHash(0xA1);
-        bytes32 t2 = FillHash(0xA2);
-
-        LeafReveal r1(t1, 50);
-        r1.AddProof(np.CreateProof(t1));
-        LeafReveal r2(t2, 50);
-        r2.AddProof(np.CreateProof(t2));
-
-        Check(pool.AddReveal(r1), "first reveal admitted");
-        Check(pool.AddReveal(r2), "second reveal admitted");
-        Check(pool.RevealCount() == 2, "queue holds both");
-        Check(!pool.AddReveal(r1),
-              "a second reveal for the same transaction is refused");
-
-        Check(pool.HasReveal(t1), "queue reports what it holds");
-        LeafReveal fetched;
-        Check(pool.GetReveal(fetched, t1) && fetched.GetTxid() == t1,
-              "a reveal comes back unchanged");
-
-        Check(pool.GetReveals(10).size() == 2,
-              "block assembly sees both");
-        Check(pool.GetReveals(1).size() == 1,
-              "block assembly respects the cap");
-
-        LeafReveal malformed(FillHash(0xA3), 50);
-        Check(!pool.AddReveal(malformed),
-              "a reveal with no proofs is refused");
-
-        // A block settled one of them.
-        std::vector<LeafReveal> mined;
-        mined.push_back(r1);
-        pool.RemoveRevealsForBlock(mined);
-        Check(pool.RevealCount() == 1 && !pool.HasReveal(t1),
-              "a settled reveal leaves the queue");
-
-        // And the other's transaction stopped being held.
-        std::vector<bytes32> stillHeld;
-        Check(pool.DropRevealsNotHeld(stillHeld) == 1,
-              "a reveal for a spend no longer held is dropped");
-        Check(pool.RevealCount() == 0, "queue is empty");
-
-        // The queue must survive a transaction-side clear-out untouched,
-        // and vice versa: they are separate resources.
-        pool.AddReveal(r2);
-        Check(pool.RevealCount() == 1 && pool.Size() == 0,
-              "reveals and transactions are counted apart");
-        pool.Clear();
-        Check(pool.RevealCount() == 0, "Clear empties both");
-    }
 
     // End to end: the path a real payment takes, from a signed transaction
     // through to settlement.
@@ -808,126 +387,6 @@ int main() {
     // proof inside the transaction, and the wallet had stopped putting one
     // there. Each half was correct and they disagreed about the model.
     // Only a test that crosses the boundary can see that.
-    {
-        storage::UTXOSet e2e(dataDir / "e2e", 1 << 20);
-
-        std::vector<uint8_t> raw(NetParams::NOISE_FILE_BYTES);
-        for (size_t i = 0; i < raw.size(); ++i) {
-            raw[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
-        }
-        NoiseFile pool = NoiseFile::Generate(raw, NetParams::NOISE_LEAF_COUNT);
-        const bytes32 kps = pool.GetRoot();
-
-        SecretKey sk = SecretKey::Random();
-        PublicKey pk = sk.GetPublicKey();
-        const bytes32 myHash = NoiseBoundHash(pk, kps);
-
-        OutPoint funded(FillHash(0x81), 0);
-        Check(e2e.AddCoin(funded, Coin(500000, myHash, 1, false)),
-              "e2e: funding coin exists");
-
-        // Built the way the wallet builds one: signature and KPS, no proof.
-        Transaction tx;
-        {
-            TxInput in;
-            in.SetPrevTxHash(funded.txHash);
-            in.SetOutputIndex(0);
-            in.SetPubkey(pk.GetKey());
-            in.SetKps(kps);
-            bytes64 blank; blank.fill(0);
-            in.SetSignature(blank);
-            tx.AddInput(in);
-            tx.AddOutput(TxOutput(400000, FillHash(0x82)));
-
-            const bytes32 sighash = tx.GetSignatureHash(0);
-            bytes64 sig = sk.Sign(sighash.data(), sighash.size());
-            std::vector<TxInput> ins = tx.GetInputs();
-            ins[0].SetSignature(sig);
-            tx.ClearInputs();
-            tx.AddInput(ins[0]);
-        }
-
-        // Without a proof the spend is refused. The signature alone proves
-        // possession of the key and nothing about the noise file, which is
-        // exactly the case this shield exists for.
-        {
-            validation::TxValidationState nstate;
-            Check(!validation::TxValidation::VerifyTransactionSignatures(
-                      tx, e2e, nstate),
-                  "e2e: a transaction carrying no proof is refused");
-        }
-
-        // With one, it goes through. The proof rides inside the input and
-        // is left out of the transaction hash, so it can bind to that hash.
-        {
-            std::vector<TxInput> ins = tx.GetInputs();
-            NoiseProof p = pool.CreateProof(tx.GetHash());
-            ins[0].SetNoiseProof(p.Serialize());
-            tx.ClearInputs();
-            tx.AddInput(ins[0]);
-        }
-
-        validation::TxValidationState vstate;
-        Check(validation::TxValidation::VerifyTransactionSignatures(
-                  tx, e2e, vstate),
-              "e2e: a transaction carrying its proof is accepted");
-
-        // A proof from somebody else's file is refused. The address binds
-        // to the owner's KPS, so a valid proof from the wrong tree settles
-        // nothing.
-        {
-            Transaction wrong = tx;
-            std::vector<TxInput> ins = wrong.GetInputs();
-            NoiseProof p = pool.CreateProof(wrong.GetHash());
-            ins[0].SetNoiseProof(p.Serialize());
-            bytes32 otherKps = ins[0].GetKps();
-            otherKps[0] ^= 0xFF;
-            ins[0].SetKps(otherKps);
-            wrong.ClearInputs();
-            wrong.AddInput(ins[0]);
-
-            validation::TxValidationState wstate;
-            Check(!validation::TxValidation::VerifyTransactionSignatures(
-                      wrong, e2e, wstate),
-                  "e2e: a proof against the wrong KPS is refused");
-        }
-
-        // Block 200 holds it.
-        Coin spent;
-        e2e.GetCoin(funded, spent);
-        std::vector<Coin> spentCoins;
-        spentCoins.push_back(spent);
-        Check(e2e.AddPendingSpend(tx, 200, spentCoins, 1000),
-              "e2e: block 200 holds the spend");
-
-        Coin ghost;
-        Check(e2e.GetCoin(funded, ghost),
-              "e2e: the input is still unspent while held");
-        Check(!e2e.GetCoin(OutPoint(tx.GetHash(), 0), ghost),
-              "e2e: the payment has not arrived yet");
-
-        // Block 201 publishes the leaves.
-        LeafReveal reveal(tx.GetHash(), 200);
-        reveal.AddProof(pool.CreateProof(tx.GetHash()));
-
-        std::string why;
-        Check(validation::RevealValidation::CheckReveal(
-                  reveal, 201, e2e, why) ==
-              validation::RevealResult::VALID,
-              "e2e: the reveal is accepted in block 201");
-
-        Check(e2e.FinalizePendingSpend(reveal.GetTxid()),
-              "e2e: the spend settles");
-        e2e.MarkNoiseLeafSpent(kps, reveal.GetProofs()[0].leafIndex);
-
-        Check(!e2e.GetCoin(funded, ghost),
-              "e2e: the input is gone after settlement");
-        Check(e2e.GetCoin(OutPoint(tx.GetHash(), 0), ghost) &&
-              ghost.value == 400000,
-              "e2e: the recipient has the money");
-        Check(e2e.PendingSpendCount() == 0,
-              "e2e: nothing is left waiting");
-    }
 
     // Genesis carries work, and block 1 must end up with strictly more.
     //
@@ -971,52 +430,6 @@ int main() {
     //
     // The fee belongs to whoever settles the spend, and settlement is what
     // a reveal does.
-    {
-        storage::UTXOSet fees(dataDir / "fees", 1 << 20);
-
-        bytes32 owner = FillHash(0xB1);
-        OutPoint op(FillHash(0xB2), 0);
-        Check(fees.AddCoin(op, Coin(500000, owner, 1, false)), "coin funded");
-
-        std::vector<uint8_t> raw(64 * 32);
-        for (size_t i = 0; i < raw.size(); ++i) {
-            raw[i] = static_cast<uint8_t>((i * 31 + 6) & 0xFF);
-        }
-        NoiseFile pool = NoiseFile::Generate(raw, 64);
-
-        Transaction tx = MakeBareTx(op.txHash, 0, pool.GetRoot(),
-                                    FillHash(0xB3), 400000);
-        Coin held; fees.GetCoin(op, held);
-        std::vector<Coin> spent; spent.push_back(held);
-
-        const int64_t fee = held.value - tx.GetValueOut();
-        Check(fee == 100000, "the transaction pays a fee of 100000");
-
-        Check(fees.AddPendingSpend(tx, 10, spent, fee), "spend held");
-
-        // While held, nothing has moved: the input is still there and the
-        // outputs do not exist. So there is nothing for a coinbase to claim.
-        Coin still;
-        Check(fees.GetCoin(op, still) && still.value == 500000,
-              "the input is untouched while held, so no fee has been paid");
-        Coin ghost;
-        Check(!fees.GetCoin(OutPoint(tx.GetHash(), 0), ghost),
-              "no output exists while held");
-
-        // The fee travels with the held record, so the block that settles
-        // it can find out what it is owed.
-        storage::PendingSpend rec;
-        Check(fees.GetPendingSpend(tx.GetHash(), rec) && rec.fee == 100000,
-              "the fee is carried on the held record until settlement");
-
-        // Released without a reveal: the coins never moved, so a fee paid
-        // at hold time would have been minted from nothing.
-        Check(fees.ReleasePendingSpend(tx.GetHash()), "hold released");
-        Check(fees.GetCoin(op, still) && still.value == 500000,
-              "after release the coin is whole, nothing was ever spent");
-        Check(!fees.GetCoin(OutPoint(tx.GetHash(), 0), ghost),
-              "and no output was ever created");
-    }
 
     // Money arithmetic. Every one of these is a way coins could be created
     // from nothing, so each is checked rather than assumed.
@@ -1050,9 +463,10 @@ int main() {
                   NetParams::HALVING_INTERVAL * 64) == 0ULL,
               "an absurd height returns zero instead of shifting past 63");
 
-        // Total issuance, computed the way the chain will actually pay it
-        // out. This is every coin that will ever exist.
-        int64_t issued = NetParams::GENESIS_REWARD;
+        // Total issuance. Height zero falls inside the first epoch, so the
+        // schedule already accounts for it and the genesis reward is not
+        // added on top.
+        int64_t issued = 0;
         for (uint64_t epoch = 0; epoch < 33; ++epoch) {
             const uint64_t height = epoch * NetParams::HALVING_INTERVAL;
             const int64_t perBlock =
@@ -1060,10 +474,24 @@ int main() {
             issued += perBlock *
                 static_cast<int64_t>(NetParams::HALVING_INTERVAL);
         }
-        Check(issued == 2999989297077940LL,
-              "total issuance is exactly 29,999,892.97077940 MONEU");
+        Check(issued == 2999981597077940LL,
+              "total issuance is exactly 29,999,815.97077940 MONEU");
         Check(issued < NetParams::MAX_MONEY,
               "total issuance stays under MAX_MONEY");
+        Check(NetParams::GENESIS_REWARD ==
+                  static_cast<int64_t>(NetParams::GetBlockSubsidy(0)),
+              "the genesis reward is the epoch-zero subsidy, not an extra");
+
+        // Summing height by height must give the same figure, which is what
+        // rules out an off-by-one at an epoch boundary.
+        int64_t walked = 0;
+        for (uint64_t h = 0; h < 33ULL * NetParams::HALVING_INTERVAL; ++h) {
+            walked += static_cast<int64_t>(NetParams::GetBlockSubsidy(h));
+        }
+        Check(walked == issued,
+              "the height-by-height sum matches the epoch sum");
+        Check(NetParams::MAX_MONEY - issued == 18402922060LL,
+              "184.02922060 MONEU stays unissued under the cap");
 
         // Range checks reject values outside the money range.
         Check(NetParams::CheckMoneyRange(0), "zero is in range");

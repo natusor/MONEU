@@ -141,14 +141,6 @@ std::vector<Mempool::PersistedEntry> Mempool::Snapshot() const {
         e.tx        = it->second.tx;
         e.fee       = it->second.fee;
         e.entryTime = it->second.entryTime;
-        const std::string key =
-            HashToKey(it->second.tx.GetHash());
-        std::map<std::string, LeafReveal>::const_iterator rv =
-            mReveals.find(key);
-        if (rv != mReveals.end()) {
-            e.hasReveal = true;
-            e.reveal    = rv->second;
-        }
         out.push_back(e);
     }
     std::sort(out.begin(), out.end(),
@@ -202,13 +194,7 @@ bool Mempool::Save(const boost::filesystem::path& path) const {
         buf.insert(buf.end(), raw.begin(), raw.end());
         PutU64(buf, static_cast<uint64_t>(entries[i].fee));
         PutU64(buf, static_cast<uint64_t>(entries[i].entryTime));
-        if (entries[i].hasReveal) {
-            const std::vector<uint8_t> rv = entries[i].reveal.Serialize();
-            PutU32(buf, static_cast<uint32_t>(rv.size()));
-            buf.insert(buf.end(), rv.begin(), rv.end());
-        } else {
-            PutU32(buf, 0);
-        }
+        PutU32(buf, 0);
     }
 
     const boost::filesystem::path tmp = path.string() + ".new";
@@ -315,21 +301,8 @@ size_t Mempool::Load(const boost::filesystem::path& path,
 
         uint32_t revealLen = 0;
         if (!TakeU32(buf, off, revealLen)) break;
-        LeafReveal reveal;
-        bool haveReveal = false;
         if (revealLen > 0) {
             if (off + revealLen > buf.size()) break;
-            try {
-                size_t rOff = 0;
-                reveal = LeafReveal::Deserialize(buf.data() + off,
-                                                 revealLen, rOff);
-                haveReveal = true;
-            } catch (const std::exception&) {
-                off += revealLen;
-                ++refused;
-                if (dropped != NULL) dropped(tx, context);
-                continue;
-            }
             off += revealLen;
         }
 
@@ -352,7 +325,6 @@ size_t Mempool::Load(const boost::filesystem::path& path,
                 continue;
             }
         }
-        if (haveReveal) AddReveal(reveal);
         ++restored;
     }
 
@@ -639,78 +611,6 @@ int64_t Mempool::GetMinFeeRate() const {
     return GetMinFeeRateLocked(NowSeconds());
 }
 
-bool Mempool::AddReveal(const LeafReveal& reveal) {
-    if (!reveal.IsWellFormed()) return false;
-    std::lock_guard<std::mutex> lock(mMutex);
-    const std::string key = HashToKey(reveal.GetTxid());
-    if (mReveals.find(key) != mReveals.end()) {
-        return false;
-    }
-    mReveals[key] = reveal;
-    return true;
-}
-
-bool Mempool::HasReveal(const bytes32& txid) const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    return mReveals.find(HashToKey(txid)) != mReveals.end();
-}
-
-bool Mempool::GetReveal(LeafReveal& out, const bytes32& txid) const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    auto it = mReveals.find(HashToKey(txid));
-    if (it == mReveals.end()) return false;
-    out = it->second;
-    return true;
-}
-
-bool Mempool::RemoveReveal(const bytes32& txid) {
-    std::lock_guard<std::mutex> lock(mMutex);
-    return mReveals.erase(HashToKey(txid)) > 0;
-}
-
-std::vector<LeafReveal> Mempool::GetReveals(size_t maxCount) const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    std::vector<LeafReveal> out;
-    out.reserve(mReveals.size() < maxCount ? mReveals.size() : maxCount);
-    for (const auto& entry : mReveals) {
-        if (out.size() >= maxCount) break;
-        out.push_back(entry.second);
-    }
-    return out;
-}
-
-void Mempool::RemoveRevealsForBlock(
-    const std::vector<LeafReveal>& blockReveals) {
-    std::lock_guard<std::mutex> lock(mMutex);
-    for (size_t i = 0; i < blockReveals.size(); ++i) {
-        mReveals.erase(HashToKey(blockReveals[i].GetTxid()));
-    }
-}
-
-size_t Mempool::DropRevealsNotHeld(const std::vector<bytes32>& stillHeld) {
-    std::lock_guard<std::mutex> lock(mMutex);
-    std::set<std::string> keep;
-    for (size_t i = 0; i < stillHeld.size(); ++i) {
-        keep.insert(HashToKey(stillHeld[i]));
-    }
-    size_t dropped = 0;
-    auto it = mReveals.begin();
-    while (it != mReveals.end()) {
-        if (keep.find(it->first) == keep.end()) {
-            it = mReveals.erase(it);
-            dropped++;
-        } else {
-            ++it;
-        }
-    }
-    return dropped;
-}
-
-size_t Mempool::RevealCount() const {
-    std::lock_guard<std::mutex> lock(mMutex);
-    return mReveals.size();
-}
-
 size_t Mempool::Size() const {
     std::lock_guard<std::mutex> lock(mMutex);
     return mIndex.size();
@@ -723,7 +623,6 @@ size_t Mempool::SizeBytes() const {
 
 void Mempool::Clear() {
     std::lock_guard<std::mutex> lock(mMutex);
-    mReveals.clear();
     mIndex.clear();
     mByFeeRate.clear();
     mByTime.clear();

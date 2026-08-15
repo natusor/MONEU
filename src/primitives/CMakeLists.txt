@@ -2,7 +2,6 @@ add_library(moneu_primitives STATIC
     keys.cpp
     script.cpp
     transaction.cpp
-    leaf_reveal.cpp
     block.cpp
 )
 

@@ -17,31 +17,8 @@ struct TxUndo {
     std::vector<Coin> spentCoins;
 };
 
-struct RevealUndo {
-    bytes32           txid;
-    uint32_t          pendingHeight;
-    int64_t           fee;
-    Transaction       tx;
-    std::vector<Coin> spentCoins;
-
-    RevealUndo() : pendingHeight(0), fee(0) { txid.fill(0); }
-};
-
-struct ExpiryUndo {
-    bytes32           txid;
-    uint32_t          pendingHeight;
-    int64_t           fee;
-    Transaction       tx;
-    std::vector<Coin> spentCoins;
-
-    ExpiryUndo() : pendingHeight(0), fee(0) { txid.fill(0); }
-};
-
 struct BlockUndo {
     std::vector<TxUndo> txUndo;
-
-    std::vector<RevealUndo>  revealUndo;
-    std::vector<ExpiryUndo>  expiryUndo;
 
     std::vector<uint8_t> Serialize() const;
     static BlockUndo Deserialize(const uint8_t* data, size_t len);

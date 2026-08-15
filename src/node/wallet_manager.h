@@ -13,7 +13,6 @@
 #include "../wallet/noise_otp.h"
 #include "../wallet/noise_store.h"
 #include "../crypto/secure_enc.h"
-#include "../primitives/leaf_reveal.h"
 
 extern "C" {
     #include "../wallet/bip32.h"
@@ -148,8 +147,6 @@ private:
     // would otherwise lose the proofs - the leaves would already be
     // consumed, so they could not be made again, and the payment would sit
     // held until it expired.
-    std::map<std::string, std::vector<NoiseProof> > mPreparedProofs;
-
     // On-disk format version. Version 2 carries the AES-CBC IV and holds
     // an AES-encrypted entropy field; version 1 files are not readable.
     // Version 4 stores proofs prepared for transactions awaiting their
@@ -321,18 +318,6 @@ public:
 
     // Assemble the reveal for a transaction now known to sit at height.
     // False when nothing was prepared for it.
-    bool BuildReveal(LeafReveal& out,
-                     const bytes32& txid,
-                     uint32_t height) const;
-
-    // Transactions this wallet is still holding proofs for.
-    std::vector<bytes32> GetPreparedRevealTxids() const;
-
-    // Forget the proofs for a transaction, once it has settled or its
-    // window has closed. Returns false if nothing was held for it.
-    bool DropPreparedReveal(const bytes32& txid);
-
-    size_t PreparedRevealCount() const;
     bool IsNoiseLoaded() const { return mNoiseLoaded; }
     const bytes32& GetNoiseKps() const;
     uint32_t GetNoiseRemaining() const;

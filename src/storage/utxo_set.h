@@ -27,11 +27,11 @@ namespace fs = boost::filesystem;
 
 static const char DB_UTXO      = 'U';
 static const char DB_UTXO_BEST = 'u';
+static const char DB_UTXO_HEADS = 'h';
 static const char DB_UTXO_HEAD = 'h';
 
 static const char DB_NOISE_LEAF = 'N';
 
-static const char DB_PENDING = 'P';
 
 struct OutPoint {
     bytes32  txHash;
@@ -129,18 +129,6 @@ struct UTXOEntry {
 
 using UTXOMap = std::unordered_map<OutPoint, UTXOEntry, OutPointHasher>;
 
-struct PendingSpend {
-    Transaction       tx;
-    uint32_t          height;
-    std::vector<Coin> spentCoins;
-    int64_t           fee;
-
-    PendingSpend() : height(0), fee(0) {}
-
-    std::vector<uint8_t> Serialize() const;
-    static PendingSpend Deserialize(const uint8_t* data, size_t len);
-};
-
 class UTXOSet {
 private:
     std::unique_ptr<DBWrapper> mDB;
@@ -153,23 +141,17 @@ private:
     std::set<NoiseLeafKey>     mSpentLeafDirty;
     std::set<NoiseLeafKey>     mErasedLeafDirty;
 
-    std::map<bytes32, PendingSpend> mPendingCache;
-    std::map<OutPoint, bytes32>     mPendingByOutpoint;
-    std::set<bytes32>               mPendingDirty;
-    std::set<bytes32>               mErasedPendingDirty;
-
     bool GetCoinLocked(const OutPoint& outpoint, Coin& coin) const;
     bool SpendCoinLocked(const OutPoint& outpoint);
     bool AddCoinLocked(const OutPoint& outpoint, const Coin& coin);
-
-    void IndexPendingLocked(const PendingSpend& pending);
-    void UnindexPendingLocked(const PendingSpend& pending);
-    bool LoadPendingLocked(const bytes32& txid, PendingSpend& out) const;
+    void SpendCoinIfPresentLocked(const OutPoint& outpoint);
+    void AddCoinOverwriteLocked(const OutPoint& outpoint, const Coin& coin);
 
     static const size_t DEFAULT_CACHE_ENTRIES = 100000;
     static const size_t MAX_BATCH_SIZE        = 16 * 1024 * 1024;
 
     bool FlushCache(const bytes32& bestBlock);
+    bool ReadHeadBlocksLocked(bytes32& newTip, bytes32& oldTip) const;
 
     bool IsNoiseLeafSpentLocked(const bytes32& kps, uint32_t leafIndex) const;
     void MarkNoiseLeafSpentLocked(const bytes32& kps, uint32_t leafIndex);
@@ -209,37 +191,14 @@ public:
     bool GetHighestSpentNoiseLeaf(const bytes32& kps,
                                   uint32_t& highestOut) const;
 
-    bool AddPendingSpend(const Transaction& tx,
-                         uint32_t height,
-                         const std::vector<Coin>& spentCoins,
-                         int64_t fee);
-
-    bool GetPendingSpend(const bytes32& txid, PendingSpend& out) const;
-    bool HasPendingSpend(const bytes32& txid) const;
-
-    bool IsOutpointPending(const OutPoint& outpoint,
-                           bytes32* holderTxid = NULL) const;
-
-    bool FinalizePendingSpend(const bytes32& txid);
-
-    bool ReleasePendingSpend(const bytes32& txid);
-
-    bool UnfinalizePendingSpend(const Transaction& tx,
-                                uint32_t pendingHeight,
-                                const std::vector<Coin>& spentCoins,
-                                int64_t fee);
-
-    bool RestorePendingSpend(const Transaction& tx,
-                             uint32_t pendingHeight,
-                             const std::vector<Coin>& spentCoins,
-                             int64_t fee);
-
-    std::vector<bytes32> GetPendingSpendsAtHeight(uint32_t height) const;
-
-    size_t PendingSpendCount() const;
-
     bytes32 GetBestBlock() const;
     bool SetBestBlock(const bytes32& blockHash);
+
+    bool GetHeadBlocks(bytes32& newTip, bytes32& oldTip) const;
+
+    bool ApplyTransactionForReplay(const Transaction& tx,
+                                   uint32_t height,
+                                   bool isCoinbase);
 
     bool Flush();
     bool Sync();
