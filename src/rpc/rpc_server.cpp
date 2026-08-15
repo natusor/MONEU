@@ -1146,6 +1146,7 @@ void RegisterBlockchainRPCCommands(RPCTable& table) {
             result["bits"]              = hdr.GetBits();
             result["nonce"]             = hdr.GetNonce();
             result["merkleroot"]        = BytesToHex(hdr.GetMerkleRoot());
+            result["leafroot"]          = BytesToHex(hdr.GetLeafRoot());
             result["previousblockhash"] = BytesToHex(hdr.GetPrevBlockHash());
             result["ntx"]               = block.GetTransactionCount();
 
