@@ -256,7 +256,8 @@ public:
         int64_t fee,
         const storage::UTXOSet& utxoSet,
         uint32_t chainHeight,
-        const std::vector<Transaction>* poolTxs = NULL);
+        const std::vector<Transaction>* poolTxs = NULL,
+        const std::vector<uint8_t>* message = NULL);
 
     // Outputs this wallet has committed to a transaction that has not been
     // confirmed yet.

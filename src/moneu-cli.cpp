@@ -352,7 +352,7 @@ static void PrintUsage() {
            "Find addresses this wallet's seed produces that hold coins\n"
         << "  importprivkey <privkey> <password> [label]  "
            "Take one private key into this wallet\n"
-        << "  sendtoaddress <address> <amount> <password>  "
+        << "  sendtoaddress <address> <amount> [fee] [message]  "
            "Send funds\n"
         << "  sendrawtransaction <hex>  "
            "Broadcast a prepared transaction\n\n"
@@ -611,16 +611,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (command == "sendtoaddress" && params.size() >= 3) {
-        json rebuilt = json::array();
-        rebuilt.push_back(params[0]);
-        rebuilt.push_back(params[1]);
-        rebuilt.push_back(nullptr);
-        if (params.size() >= 4) {
-            rebuilt.push_back(params[3]);
-        }
-        params = rebuilt;
-    }
 
     const bool reportNoise = (command == "sendtoaddress");
 

@@ -567,8 +567,16 @@ Transaction WalletManager::CreateTransaction(
     int64_t fee,
     const storage::UTXOSet& utxoSet,
     uint32_t chainHeight,
-    const std::vector<Transaction>* poolTxs)
+    const std::vector<Transaction>* poolTxs,
+    const std::vector<uint8_t>* message)
 {
+    if (message != NULL && message->size() > NetParams::MAX_OP_RETURN_SIZE) {
+        throw WalletError(
+            "Message is " + std::to_string(message->size()) +
+            " bytes; the limit is " +
+            std::to_string(NetParams::MAX_OP_RETURN_SIZE));
+    }
+
     std::lock_guard<std::mutex> lock(mMutex);
 
     if (mLocked || mUnlockedSeed.size() != 64) {
@@ -723,6 +731,12 @@ Transaction WalletManager::CreateTransaction(
     }
 
     builder.AddOutput(amount, toPubkeyHash);
+
+    // A message rides along as an output that carries no value and cannot
+    // be spent, so it leaves nothing behind in the unspent set.
+    if (message != NULL && !message->empty()) {
+        builder.AddDataOutput(*message);
+    }
 
     int64_t change = collected - needed;
     if (change > NetParams::DUST_THRESHOLD) {

@@ -100,6 +100,42 @@ bool ParseAmount(const std::string& text, int64_t& out, std::string& why) {
     return true;
 }
 
+// Bytes a signed input carries beyond an unsigned one. Signing attaches a
+// noise proof, and its serialized length is fixed by the leaf count: the
+// path is one hash and one direction bit per level, so the whole record is
+// the same size for every spend. Knowing it up front lets the fee be
+// settled before the transaction is built rather than after, which is when
+// the size would otherwise first be measurable.
+int HexDigit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+size_t NoiseProofBytesPerInput() {
+    size_t depth = 0;
+    uint32_t leaves = NetParams::NOISE_LEAF_COUNT_VALUE;
+    while (leaves > 1) { leaves >>= 1; ++depth; }
+    const size_t proof = 4 + 32 + 32 + 4 + depth * 32 + depth;
+    return 4 + proof;
+}
+
+// What the transaction will weigh once it is signed.
+size_t SignedSizeOf(const MONEU::Transaction& tx) {
+    return tx.GetSerializedSize(true) +
+           tx.GetInputCount() * NoiseProofBytesPerInput();
+}
+
+// The fee that size demands, by the same rule validation applies:
+// max(size * MIN_FEE_PER_BYTE, MIN_TX_FEE).
+int64_t RequiredFeeForSize(size_t size) {
+    const int64_t perByte =
+        static_cast<int64_t>(size) * NetParams::MIN_FEE_PER_BYTE;
+    return (perByte > NetParams::MIN_TX_FEE)
+               ? perByte : NetParams::MIN_TX_FEE;
+}
+
 // The same value straight from JSON, whether it arrived as a string or a
 // number. A number is re-rendered without exponent so ParseAmount sees the
 // digits the caller meant.
@@ -2106,6 +2142,34 @@ void RegisterWalletRPCCommands(RPCTable& table) {
             if (amount <= 0)
                 throw RPCError(RPC_INVALID_PARAMS,
                     "Amount too small");
+            // An optional message, given as hex, that travels with the
+            // transfer as an output carrying no value.
+            std::vector<uint8_t> message;
+            if (req.params.size() >= 4 && !req.params[3].is_null()) {
+                if (!req.params[3].is_string())
+                    throw RPCError(RPC_INVALID_PARAMS,
+                        "Message must be a hex string");
+                const std::string hex = req.params[3].get<std::string>();
+                if (hex.size() % 2 != 0)
+                    throw RPCError(RPC_INVALID_PARAMS,
+                        "Message hex has an odd number of digits");
+                if (hex.size() / 2 > NetParams::MAX_OP_RETURN_SIZE)
+                    throw RPCError(RPC_INVALID_PARAMS,
+                        "Message is " + std::to_string(hex.size() / 2) +
+                        " bytes; the limit is " +
+                        std::to_string(NetParams::MAX_OP_RETURN_SIZE));
+                message.reserve(hex.size() / 2);
+                for (size_t i = 0; i < hex.size(); i += 2) {
+                    const int hi = HexDigit(hex[i]);
+                    const int lo = HexDigit(hex[i + 1]);
+                    if (hi < 0 || lo < 0)
+                        throw RPCError(RPC_INVALID_PARAMS,
+                            "Message is not valid hex");
+                    message.push_back(
+                        static_cast<uint8_t>((hi << 4) | lo));
+                }
+            }
+
             // What the pool is holding, so the wallet can spend the change
             // of its own transfers that have not confirmed yet and can hold
             // back outputs one of them already took.
@@ -2125,23 +2189,20 @@ void RegisterWalletRPCCommands(RPCTable& table) {
                     toAddress, amount, fee,
                     ctx.chainState->GetUTXOSet(),
                     ctx.chainState->GetHeight(),
-                    &poolTxs);
+                    &poolTxs, &message);
             } catch (const node::WalletError& e) {
                 throw RPCError(RPC_MISC_ERROR,
                     std::string("CreateTransaction failed: ")
                     + e.what());
             }
 
-            // When the fee was not fixed by the caller, raise it to the
-            // size-based minimum if the built transaction is large enough to
-            // require more than the floor, then rebuild once at that fee.
+            // The fee the size will demand once the proofs are attached.
+            // Measuring the unsigned transaction would read short by the
+            // proof bytes and leave the fee under the minimum, so the size
+            // is projected from the input count instead.
             if (!feeExplicit) {
-                int64_t sizeFee =
-                    static_cast<int64_t>(tx.GetSerializedSize(true)) *
-                    NetParams::MIN_FEE_PER_BYTE;
-                int64_t required =
-                    (sizeFee > NetParams::MIN_TX_FEE)
-                        ? sizeFee : NetParams::MIN_TX_FEE;
+                const int64_t required =
+                    RequiredFeeForSize(SignedSizeOf(tx));
                 if (required > fee) {
                     fee = required;
                     try {
@@ -2153,12 +2214,24 @@ void RegisterWalletRPCCommands(RPCTable& table) {
                             toAddress, amount, fee,
                             ctx.chainState->GetUTXOSet(),
                             ctx.chainState->GetHeight(),
-                            &poolTxs);
+                            &poolTxs, &message);
                     } catch (const node::WalletError& e) {
                         throw RPCError(RPC_MISC_ERROR,
                             std::string("CreateTransaction failed: ")
                             + e.what());
                     }
+                }
+            } else {
+                const int64_t required =
+                    RequiredFeeForSize(SignedSizeOf(tx));
+                if (fee < required) {
+                    ctx.wallet->ReleaseOutpointsFor(tx.GetHash());
+                    throw RPCError(RPC_INVALID_PARAMS,
+                        "Fee " + std::to_string(fee) +
+                        " is below the minimum " +
+                        std::to_string(required) +
+                        " this transfer requires; omit the fee to have it "
+                        "set from the size");
                 }
             }
             if (!ctx.wallet->SignTransaction(tx))
