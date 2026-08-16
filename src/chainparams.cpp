@@ -29,10 +29,10 @@ const uint8_t EXT_SECRET_KEY_PREFIX[4] = {0x03, 0xA0, 0x68, 0x6E};
 const char* GENESIS_MESSAGE =
     "54686520477561726469616e205765656b6c792031342f4175672f323032362047"
     "6f6e6520726f6775653a20414920747269636b73206974732074657374657273";
-const uint64_t GENESIS_TIMESTAMP = 1786717047;
+const uint64_t GENESIS_TIMESTAMP = 1786724267;
 const uint32_t GENESIS_VERSION = 1;
 const int64_t GENESIS_REWARD = 7700000000LL;
-const uint32_t GENESIS_NONCE = 3223497051U;
+const uint32_t GENESIS_NONCE = 1708084064U;
 
 const char* GENESIS_REWARD_PUBKEYHASH_HEX =
     "8fb311b4e4a09e775d0e9910e2ff55325469e8b7a0b7085bd2fd1b0c80a316c5";
@@ -67,7 +67,7 @@ const uint32_t MAX_TOTAL_CONNECTIONS = 125;
 const uint32_t PEER_DISCOVERY_TIMEOUT = 60;
 
 const Checkpoint MAINNET_CHECKPOINTS[] = {
-    {0, "00000000ce0d78378c3d6e23780d671d3fe678e218e6df9d8a429cddef5bfb3a"}
+    {0, "00000000a03ce5faf3e74612dc86207af4b317a840cbeb0a2bb672475a04a9ea"}
 };
 const size_t CHECKPOINT_COUNT = sizeof(MAINNET_CHECKPOINTS) / sizeof(Checkpoint);
 
@@ -148,7 +148,7 @@ bool VerifyNetworkMagic(const uint8_t* magic) {
 
 PNC::bytes32 GetGenesisHash() {
     return HexToBytes32(
-        "00000000ce0d78378c3d6e23780d671d3fe678e218e6df9d8a429cddef5bfb3a");
+        "00000000a03ce5faf3e74612dc86207af4b317a840cbeb0a2bb672475a04a9ea");
 }
 
 bool IsCheckpoint(uint64_t height) {
