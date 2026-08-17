@@ -67,8 +67,6 @@ extern const uint32_t  NOISE_LEAF_COUNT;
 static const size_t NOISE_FILE_BYTES =
     (size_t)NOISE_LEAF_COUNT_VALUE * 32u;
 
-extern const uint32_t REVEAL_WINDOW_BLOCKS;
-
 extern const uint32_t  MAX_OUTBOUND_CONNECTIONS;
 extern const uint32_t  MAX_INBOUND_CONNECTIONS;
 extern const uint32_t  MAX_TOTAL_CONNECTIONS;

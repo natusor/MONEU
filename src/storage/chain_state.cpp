@@ -63,8 +63,6 @@ bool LastCheckpointHeight(const BlockData& blockData, uint32_t& heightOut) {
 
 }
 
-static const uint32_t MAX_REORG_DEPTH = 1000;
-
 ChainState::ChainState(const fs::path& dataDir,
                         size_t nCacheSize)
     : mInitialized(false)
