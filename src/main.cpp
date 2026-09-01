@@ -43,6 +43,7 @@ extern "C" {
 #include "node/node_identity.h"
 #include "net/net.h"
 #include "rpc/rpc_server.h"
+#include "consensus/pow.h"
 #include "validation/block_validation.h"
 #include "validation/tx_validation.h"
 #include "chainparams.h"
@@ -780,6 +781,19 @@ int main(int argc, char* argv[]) {
 
             const bytes32 prevHash = hdr.GetPrevBlockHash();
             if (!node.chainState->HasBlock(prevHash)) {
+                if (block.GetSerializedSize() > NetParams::MAX_BLOCK_SIZE) {
+                    LOG_WARN("NET: oversized block from peer=" +
+                        std::to_string(id));
+                    return;
+                }
+                if (!PNC::CheckProofOfWork(blockHash, hdr.GetBits())) {
+                    LOG_WARN("NET: block from peer=" + std::to_string(id) +
+                        " does not meet its own target");
+                    return;
+                }
+                if (hdr.GetHeight() <= node.chainState->GetHeight()) {
+                    return;
+                }
                 ParkOrphanBlock(prevHash, block);
                 LOG_DEBUG("NET: block at height " +
                     std::to_string(hdr.GetHeight()) +
