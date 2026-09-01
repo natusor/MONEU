@@ -19,6 +19,8 @@
 #include <ctime>
 #include <random>
 #include <functional>
+#include <map>
+#include <deque>
 
 #ifndef WIN32
 #include <sys/stat.h>
@@ -56,6 +58,56 @@ void RequestShutdown() {
     std::lock_guard<std::mutex> lock(gShutdownMutex);
     gShutdown = true;
     gShutdownCV.notify_all();
+}
+
+static const size_t MAX_ORPHAN_BLOCKS = 500;
+
+static std::mutex                     gOrphanMutex;
+static std::multimap<bytes32, Block>  gOrphanBlocks;
+static std::deque<bytes32>            gOrphanOrder;
+
+static void ParkOrphanBlock(const bytes32& parentHash, const Block& block)
+{
+    std::lock_guard<std::mutex> lock(gOrphanMutex);
+
+    const bytes32 blockHash = block.GetHeader().GetHash();
+    auto range = gOrphanBlocks.equal_range(parentHash);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second.GetHeader().GetHash() == blockHash) return;
+    }
+
+    while (gOrphanBlocks.size() >= MAX_ORPHAN_BLOCKS && !gOrphanOrder.empty()) {
+        const bytes32 oldestParent = gOrphanOrder.front();
+        gOrphanOrder.pop_front();
+        auto oldest = gOrphanBlocks.find(oldestParent);
+        if (oldest != gOrphanBlocks.end()) {
+            gOrphanBlocks.erase(oldest);
+        }
+    }
+
+    gOrphanBlocks.insert(std::make_pair(parentHash, block));
+    gOrphanOrder.push_back(parentHash);
+}
+
+static std::vector<Block> TakeOrphansOf(const bytes32& parentHash)
+{
+    std::lock_guard<std::mutex> lock(gOrphanMutex);
+    std::vector<Block> out;
+    auto range = gOrphanBlocks.equal_range(parentHash);
+    for (auto it = range.first; it != range.second; ++it) {
+        out.push_back(it->second);
+    }
+    gOrphanBlocks.erase(parentHash);
+    for (auto it = gOrphanOrder.begin(); it != gOrphanOrder.end(); ) {
+        it = (*it == parentHash) ? gOrphanOrder.erase(it) : it + 1;
+    }
+    return out;
+}
+
+static size_t OrphanCount()
+{
+    std::lock_guard<std::mutex> lock(gOrphanMutex);
+    return gOrphanBlocks.size();
 }
 
 static bool          gDaemonized   = false;
@@ -718,25 +770,74 @@ int main(int argc, char* argv[]) {
         netCallbacks.onBlock = [&](
             net::NodeId id, const Block& block)
         {
-
-            validation::BlockValidationState blkState;
             const BlockHeader& hdr = block.GetHeader();
-            bytes32 blockHash = hdr.GetHash();
+            const bytes32 blockHash = hdr.GetHash();
 
             if (node.chainState->HasBlock(blockHash)) {
                 LOG_DEBUG("NET: block already known");
                 return;
             }
 
-            const uint32_t blockHeight = hdr.GetHeight();
-            (void)blkState;
+            const bytes32 prevHash = hdr.GetPrevBlockHash();
+            if (!node.chainState->HasBlock(prevHash)) {
+                ParkOrphanBlock(prevHash, block);
+                LOG_DEBUG("NET: block at height " +
+                    std::to_string(hdr.GetHeight()) +
+                    " is waiting for its parent (" +
+                    std::to_string(OrphanCount()) + " parked)");
+                if (node.connManager) {
+                    node.connManager->RequestBlocksFrom(id);
+                }
+                return;
+            }
 
             if (!node.chainState->AcceptBlock(block)) {
                 LOG_WARN("NET: ConnectBlock rejected block at height " +
-                    std::to_string(blockHeight) +
+                    std::to_string(hdr.GetHeight()) +
                     " (linkage, difficulty, proof-of-work, or state "
                     "mismatch)");
                 return;
+            }
+
+            LOG_INFO("NET: connected block height=" +
+                std::to_string(hdr.GetHeight()) +
+                " bits=" + std::to_string(hdr.GetBits()) +
+                " hash=" + HashToHex(blockHash).substr(0, 16) + "...");
+
+            if (node.connManager) {
+                node.connManager->BroadcastBlock(block);
+            }
+
+            std::vector<bytes32> frontier;
+            frontier.push_back(blockHash);
+
+            while (!frontier.empty()) {
+                const bytes32 parent = frontier.back();
+                frontier.pop_back();
+
+                std::vector<Block> waiting = TakeOrphansOf(parent);
+                for (size_t i = 0; i < waiting.size(); ++i) {
+                    const Block& child = waiting[i];
+                    const bytes32 childHash = child.GetHeader().GetHash();
+
+                    if (node.chainState->HasBlock(childHash)) continue;
+
+                    if (!node.chainState->AcceptBlock(child)) {
+                        LOG_WARN("NET: parked block at height " +
+                            std::to_string(child.GetHeader().GetHeight()) +
+                            " still refused after its parent arrived");
+                        continue;
+                    }
+
+                    LOG_INFO("NET: connected parked block height=" +
+                        std::to_string(child.GetHeader().GetHeight()) +
+                        " hash=" + HashToHex(childHash).substr(0, 16) + "...");
+
+                    if (node.connManager) {
+                        node.connManager->BroadcastBlock(child);
+                    }
+                    frontier.push_back(childHash);
+                }
             }
 
             if (node.connManager) {
@@ -744,15 +845,6 @@ int main(int argc, char* argv[]) {
             }
 
             SyncMempoolWithChain(node);
-
-            if (node.connManager) {
-                node.connManager->BroadcastBlock(block);
-            }
-
-            LOG_INFO("NET: connected block height=" +
-                std::to_string(hdr.GetHeight()) +
-                " bits=" + std::to_string(hdr.GetBits()) +
-                " hash=" + HashToHex(blockHash).substr(0, 16) + "...");
         };
 
         netCallbacks.onNodeConnected = [](net::NodeId id) {
