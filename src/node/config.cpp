@@ -152,6 +152,7 @@ void Config::ApplyRPCValues() {
         mRPC.rpcEnabled = true;
     }
     mRPC.rpcBindAddr = GetValue("rpcbind", "127.0.0.1");
+    mRPC.rpcBindSet  = !GetValue("rpcbind", "").empty();
     int64_t rpcPort = GetIntValue("rpcport", NetParams::RPC_PORT);
     if (rpcPort > 0 && rpcPort < 65536) {
         mRPC.rpcPort = static_cast<uint16_t>(rpcPort);
@@ -160,6 +161,7 @@ void Config::ApplyRPCValues() {
     for (size_t i = 0; i < allowIps.size(); ++i) {
         if (!allowIps[i].empty()) mRPC.rpcAllowIp.push_back(allowIps[i]);
     }
+    mRPC.rpcAllowIpSet = !mRPC.rpcAllowIp.empty();
     if (mRPC.rpcAllowIp.empty()) {
         mRPC.rpcAllowIp.push_back("127.0.0.1");
     }

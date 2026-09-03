@@ -59,10 +59,17 @@ struct RPCConfig {
     bool        rpcEnabled;
     std::vector<std::string> rpcAllowIp;
 
+    // Whether the config named these, as opposed to taking the default.
+    // Binding wider than the loopback takes both.
+    bool        rpcBindSet;
+    bool        rpcAllowIpSet;
+
     RPCConfig()
         : rpcBindAddr("127.0.0.1")
         , rpcPort(NetParams::RPC_PORT)
         , rpcEnabled(true)
+        , rpcBindSet(false)
+        , rpcAllowIpSet(false)
     {}
 };
 

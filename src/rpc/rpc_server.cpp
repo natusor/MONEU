@@ -6,10 +6,12 @@
 #include "../validation/tx_validation.h"
 #include "../crypto/arith_uint256.h"
 #include "../consensus/pow.h"
+#include "../log/log.h"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -242,14 +244,18 @@ std::string RPCServer::Base64Decode(const std::string& in) {
     std::vector<int> T(256, -1);
     for (int i = 0; i < 64; i++)
         T[static_cast<uint8_t>(BASE64_CHARS[i])] = i;
-    int val = 0, valb = -8;
+    // Unsigned and masked to the bits still owed to the output. As a signed
+    // int shifted left without a mask this overflowed past four characters,
+    // which is undefined behaviour on the path that checks the password.
+    uint32_t val = 0;
+    int valb = -8;
     for (uint8_t c : in) {
         if (c == '=') break;
         if (T[c] == -1) continue;
-        val = (val << 6) + T[c];
+        val = ((val << 6) | static_cast<uint32_t>(T[c])) & 0x00FFFFFFu;
         valb += 6;
         if (valb >= 0) {
-            out.push_back(char((val >> valb) & 0xFF));
+            out.push_back(static_cast<char>((val >> valb) & 0xFFu));
             valb -= 8;
         }
     }
@@ -320,6 +326,503 @@ std::vector<std::string> RPCTable::ListCommands() const {
     return result;
 }
 
+namespace {
+
+// operator== stops at the first mismatching byte, and that timing tells a
+// caller how much of a guessed password was right.
+bool TimingSafeEqual(const std::string& a, const std::string& b) {
+    const size_t n = a.size() > b.size() ? a.size() : b.size();
+    unsigned char diff =
+        static_cast<unsigned char>(a.size() != b.size() ? 1 : 0);
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char ca =
+            i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        const unsigned char cb =
+            i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+        diff = static_cast<unsigned char>(diff | (ca ^ cb));
+    }
+    return diff == 0;
+}
+
+std::string ToLowerAscii(const std::string& in) {
+    std::string out(in);
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (out[i] >= 'A' && out[i] <= 'Z')
+            out[i] = static_cast<char>(out[i] - 'A' + 'a');
+    }
+    return out;
+}
+
+std::string TrimAscii(const std::string& in) {
+    size_t b = 0;
+    size_t e = in.size();
+    while (b < e && (in[b] == ' ' || in[b] == '\t')) ++b;
+    while (e > b && (in[e - 1] == ' ' || in[e - 1] == '\t' ||
+                     in[e - 1] == '\r' || in[e - 1] == '\n')) --e;
+    return in.substr(b, e - b);
+}
+
+const char* HttpStatusText(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 408: return "Request Timeout";
+        case 413: return "Payload Too Large";
+        case 431: return "Request Header Fields Too Large";
+        case 500: return "Internal Server Error";
+        case 503: return "Service Unavailable";
+        default:  return "Error";
+    }
+}
+
+} // namespace
+
+bool RPCSubNet::Match(const RPCAddrBytes& addr) const {
+    if (addr.isV6 != isV6) return false;
+    const size_t width = isV6 ? 16u : 4u;
+    for (size_t i = 0; i < width; ++i) {
+        if (static_cast<uint8_t>(addr.bytes[i] & netmask[i]) != network[i])
+            return false;
+    }
+    return true;
+}
+
+std::string RPCSubNet::ToString() const {
+    const size_t width = isV6 ? 16u : 4u;
+    size_t bits = 0;
+    for (size_t i = 0; i < width; ++i) {
+        uint8_t byte = netmask[i];
+        while (byte & 0x80) { ++bits; byte = static_cast<uint8_t>(byte << 1); }
+    }
+    std::ostringstream oss;
+    if (isV6) {
+        std::array<unsigned char, 16> raw;
+        for (size_t i = 0; i < 16; ++i) raw[i] = network[i];
+        oss << asio::ip::address_v6(raw).to_string();
+    } else {
+        oss << static_cast<int>(network[0]) << '.'
+            << static_cast<int>(network[1]) << '.'
+            << static_cast<int>(network[2]) << '.'
+            << static_cast<int>(network[3]);
+    }
+    oss << '/' << bits;
+    return oss.str();
+}
+
+bool RPCAddressToBytes(const asio::ip::address& addr, RPCAddrBytes& out) {
+    out.bytes.fill(0);
+    if (addr.is_v4()) {
+        const asio::ip::address_v4::bytes_type raw = addr.to_v4().to_bytes();
+        out.isV6 = false;
+        for (size_t i = 0; i < 4; ++i)
+            out.bytes[i] = static_cast<uint8_t>(raw[i]);
+        return true;
+    }
+    if (!addr.is_v6()) return false;
+
+    const asio::ip::address_v6::bytes_type raw = addr.to_v6().to_bytes();
+
+    // ::ffff:a.b.c.d is an IPv4 client on a dual-stack socket. Matched as
+    // IPv6 it would make rpcallowip=127.0.0.1 miss its own loopback.
+    bool mapped = true;
+    for (size_t i = 0; i < 10; ++i) {
+        if (raw[i] != 0) { mapped = false; break; }
+    }
+    if (mapped && (raw[10] != 0xFF || raw[11] != 0xFF)) mapped = false;
+
+    if (mapped) {
+        out.isV6 = false;
+        for (size_t i = 0; i < 4; ++i)
+            out.bytes[i] = static_cast<uint8_t>(raw[12 + i]);
+        return true;
+    }
+    out.isV6 = true;
+    for (size_t i = 0; i < 16; ++i)
+        out.bytes[i] = static_cast<uint8_t>(raw[i]);
+    return true;
+}
+
+bool RPCParseSubNet(const std::string& text, RPCSubNet& out) {
+    const std::string trimmed = TrimAscii(text);
+    if (trimmed.empty()) return false;
+
+    std::string addrPart = trimmed;
+    std::string maskPart;
+    const size_t slash = trimmed.find('/');
+    if (slash != std::string::npos) {
+        addrPart = trimmed.substr(0, slash);
+        maskPart = trimmed.substr(slash + 1);
+        if (maskPart.empty()) return false;
+    }
+
+    boost::system::error_code ec;
+    const asio::ip::address addr = asio::ip::make_address(addrPart, ec);
+    if (ec) return false;
+
+    RPCAddrBytes parsed;
+    if (!RPCAddressToBytes(addr, parsed)) return false;
+
+    const size_t width = parsed.isV6 ? 16u : 4u;
+    size_t bits = width * 8;
+
+    if (!maskPart.empty()) {
+        if (maskPart.find('.') != std::string::npos) {
+            // Dotted IPv4 netmask, e.g. 255.255.255.0
+            if (parsed.isV6) return false;
+            const asio::ip::address mask =
+                asio::ip::make_address(maskPart, ec);
+            if (ec || !mask.is_v4()) return false;
+            const asio::ip::address_v4::bytes_type mb =
+                mask.to_v4().to_bytes();
+            uint32_t value = 0;
+            for (size_t i = 0; i < 4; ++i)
+                value = (value << 8) | static_cast<uint8_t>(mb[i]);
+            bits = 0;
+            while (bits < 32 && (value & (0x80000000u >> bits))) ++bits;
+            // A mask with a gap in it is a typo, not a network.
+            const uint32_t expected =
+                (bits == 0) ? 0u : (0xFFFFFFFFu << (32 - bits));
+            if (value != expected) return false;
+        } else {
+            for (size_t i = 0; i < maskPart.size(); ++i) {
+                if (maskPart[i] < '0' || maskPart[i] > '9') return false;
+            }
+            if (maskPart.size() > 3) return false;
+            const unsigned long n =
+                std::strtoul(maskPart.c_str(), NULL, 10);
+            if (n > width * 8) return false;
+            bits = static_cast<size_t>(n);
+        }
+    }
+
+    out.isV6 = parsed.isV6;
+    out.network.fill(0);
+    out.netmask.fill(0);
+    for (size_t i = 0; i < width; ++i) {
+        size_t take = 0;
+        if (bits >= (i + 1) * 8)      take = 8;
+        else if (bits > i * 8)        take = bits - i * 8;
+        const uint8_t m = (take == 0)
+            ? 0u
+            : static_cast<uint8_t>(0xFFu << (8 - take));
+        out.netmask[i] = m;
+        out.network[i] = static_cast<uint8_t>(parsed.bytes[i] & m);
+    }
+    return true;
+}
+
+// Reading is asynchronous on the single event thread, so a caller that sends
+// one byte and waits costs a socket and nothing more. Once the request is
+// whole the deadline is dropped and a worker takes sole ownership.
+class RPCConnection
+    : public std::enable_shared_from_this<RPCConnection>
+{
+public:
+    RPCConnection(RPCServer& server,
+                  asio::io_context& io,
+                  std::shared_ptr<tcp::socket> socket,
+                  const std::string& clientIP)
+        : mServer(server)
+        , mSocket(socket)
+        , mTimer(io)
+        , mClientIP(clientIP)
+        , mHeaderEnd(std::string::npos)
+        , mContentLength(0)
+        , mHaveContentLength(false)
+        , mDispatched(false)
+        , mClosed(false)
+    {
+        mServer.mActiveConnections++;
+    }
+
+    ~RPCConnection() {
+        Close();
+        mServer.mActiveConnections--;
+    }
+
+    RPCConnection(const RPCConnection&) = delete;
+    RPCConnection& operator=(const RPCConnection&) = delete;
+
+    // Event thread.
+    void Start() {
+        boost::system::error_code ec;
+        mTimer.expires_after(
+            std::chrono::seconds(RPC_CLIENT_TIMEOUT_SEC));
+        (void)ec;
+        auto self = shared_from_this();
+        mTimer.async_wait(
+            [self](const boost::system::error_code& terr) {
+                self->OnDeadline(terr);
+            });
+        DoRead();
+    }
+
+    // Refusal decided at accept time. Event thread.
+    void Reject(int status, const std::string& reason) {
+        SendStatusAndClose(status, reason);
+    }
+
+    // Worker thread. No asynchronous operation is outstanding on the socket.
+    void Execute() {
+        std::string reply;
+        try {
+            reply = mServer.BuildResponseBody(mBody, mClientIP);
+        } catch (const std::exception& e) {
+            MONEU_LOG_ERROR(std::string("RPC: command failed for ") +
+                            node::Log::PeerAddr(mClientIP) + ": " + e.what());
+            SendStatusAndClose(500, "Internal error");
+            return;
+        }
+        std::ostringstream oss;
+        oss << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << reply.size() << "\r\n"
+            << "Connection: close\r\n"
+            << "\r\n"
+            << reply;
+        WriteAllAndClose(oss.str());
+    }
+
+private:
+    void DoRead() {
+        auto self = shared_from_this();
+        mSocket->async_read_some(
+            asio::buffer(mChunk),
+            [self](const boost::system::error_code& ec, size_t n) {
+                self->OnRead(ec, n);
+            });
+    }
+
+    void OnRead(const boost::system::error_code& ec, size_t bytes) {
+        if (mDispatched || mClosed) return;
+        if (ec) {
+            // The caller went away, or the deadline closed the socket.
+            CancelTimer();
+            Close();
+            return;
+        }
+        mIn.append(mChunk.data(), bytes);
+
+        if (mHeaderEnd == std::string::npos) {
+            mHeaderEnd = mIn.find("\r\n\r\n");
+            if (mHeaderEnd == std::string::npos) {
+                if (mIn.size() > RPC_MAX_HEADERS_SIZE) {
+                    MONEU_LOG_WARN(
+                        "RPC: header block too large from" +
+                        node::Log::PeerAddr(mClientIP));
+                    SendStatusAndClose(431, "Header too large");
+                    return;
+                }
+                DoRead();
+                return;
+            }
+            if (!ParseHeaders()) return;
+        }
+
+        const size_t have = mIn.size() - (mHeaderEnd + 4);
+        if (have < mContentLength) {
+            DoRead();
+            return;
+        }
+        mBody = mIn.substr(mHeaderEnd + 4, mContentLength);
+        Dispatch();
+    }
+
+    // Answers and returns false when the request cannot be served.
+    bool ParseHeaders() {
+        const std::string head = mIn.substr(0, mHeaderEnd);
+        std::istringstream stream(head);
+        std::string line;
+
+        if (!std::getline(stream, line)) {
+            SendStatusAndClose(400, "Empty request");
+            return false;
+        }
+        if (!line.empty() && line[line.size() - 1] == '\r')
+            line.erase(line.size() - 1);
+        if (line.compare(0, 5, "POST ") != 0) {
+            MONEU_LOG_DEBUG("RPC: non-POST request from" +
+                            node::Log::PeerAddr(mClientIP));
+            SendStatusAndClose(405, "Only POST is served");
+            return false;
+        }
+
+        while (std::getline(stream, line)) {
+            if (!line.empty() && line[line.size() - 1] == '\r')
+                line.erase(line.size() - 1);
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            const std::string name  = ToLowerAscii(line.substr(0, colon));
+            const std::string value = TrimAscii(line.substr(colon + 1));
+
+            if (name == "authorization") {
+                const std::string lowered = ToLowerAscii(value);
+                if (lowered.compare(0, 6, "basic ") == 0)
+                    mAuth = TrimAscii(value.substr(6));
+            } else if (name == "content-length") {
+                if (value.empty()) {
+                    SendStatusAndClose(400, "Bad Content-Length");
+                    return false;
+                }
+                for (size_t i = 0; i < value.size(); ++i) {
+                    if (value[i] < '0' || value[i] > '9') {
+                        SendStatusAndClose(400, "Bad Content-Length");
+                        return false;
+                    }
+                }
+                if (value.size() > 20) {
+                    SendStatusAndClose(413, "Body too large");
+                    return false;
+                }
+                const unsigned long long declared =
+                    std::strtoull(value.c_str(), NULL, 10);
+                if (declared > RPC_MAX_BODY_SIZE) {
+                    MONEU_LOG_WARN(
+                        "RPC: declared body of " + value +
+                        " bytes refused from" +
+                        node::Log::PeerAddr(mClientIP));
+                    SendStatusAndClose(413, "Body too large");
+                    return false;
+                }
+                mContentLength     = static_cast<size_t>(declared);
+                mHaveContentLength = true;
+            }
+        }
+
+        if (!mHaveContentLength) {
+            SendStatusAndClose(400, "Content-Length required");
+            return false;
+        }
+        if (!mServer.CheckAuth(mAuth)) {
+            MONEU_LOG_WARN("RPC: authentication failed from" +
+                           node::Log::PeerAddr(mClientIP));
+            SendUnauthorizedAndClose();
+            return false;
+        }
+        if (mContentLength == 0) {
+            SendStatusAndClose(400, "Empty body");
+            return false;
+        }
+        // Sized by this request, not by the largest one imaginable.
+        mIn.reserve(mHeaderEnd + 4 + mContentLength);
+        return true;
+    }
+
+    // Event thread. From here the socket belongs to a worker.
+    void Dispatch() {
+        mDispatched = true;
+        CancelTimer();
+        auto self = shared_from_this();
+        if (!mServer.EnqueueConnection(self)) {
+            MONEU_LOG_WARN(
+                "RPC: work queue full, refusing a request from" +
+                node::Log::PeerAddr(mClientIP));
+            SendStatusAndClose(503, "Work queue depth exceeded");
+        }
+    }
+
+    void OnDeadline(const boost::system::error_code& ec) {
+        if (ec == asio::error::operation_aborted) return;
+        if (mDispatched || mClosed) return;
+        MONEU_LOG_DEBUG("RPC: request deadline reached for" +
+                        node::Log::PeerAddr(mClientIP));
+        SendStatusAndClose(408, "Request timed out");
+    }
+
+    void CancelTimer() {
+        boost::system::error_code ec;
+        mTimer.cancel(ec);
+    }
+
+    void SendStatusAndClose(int status, const std::string& reason) {
+        json payload;
+        payload["jsonrpc"] = "2.0";
+        payload["id"]      = nullptr;
+        payload["result"]  = nullptr;
+        payload["error"]   = {{"code", RPC_MISC_ERROR},
+                              {"message", reason}};
+        const std::string body = payload.dump();
+
+        std::ostringstream oss;
+        oss << "HTTP/1.1 " << status << ' '
+            << HttpStatusText(status) << "\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n"
+            << "\r\n"
+            << body;
+        WriteAllAndClose(oss.str());
+    }
+
+    void SendUnauthorizedAndClose() {
+        json payload;
+        payload["jsonrpc"] = "2.0";
+        payload["id"]      = nullptr;
+        payload["result"]  = nullptr;
+        payload["error"]   = {{"code", RPC_FORBIDDEN},
+                              {"message", "Authentication failed"}};
+        const std::string body = payload.dump();
+
+        std::ostringstream oss;
+        oss << "HTTP/1.1 401 Unauthorized\r\n"
+            << "WWW-Authenticate: Basic realm=\"MONEU\"\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n"
+            << "\r\n"
+            << body;
+        WriteAllAndClose(oss.str());
+    }
+
+    // Called from the event thread for refusals and from a worker for
+    // answers. Nothing else is using the socket at that moment.
+    void WriteAllAndClose(const std::string& payload) {
+        if (mClosed) return;
+        boost::system::error_code ec;
+#ifndef WIN32
+        struct timeval tv;
+        tv.tv_sec  = static_cast<time_t>(RPC_CLIENT_TIMEOUT_SEC);
+        tv.tv_usec = 0;
+        setsockopt(mSocket->native_handle(), SOL_SOCKET, SO_SNDTIMEO,
+                   &tv, sizeof(tv));
+#endif
+        asio::write(*mSocket, asio::buffer(payload), ec);
+        if (ec) {
+            MONEU_LOG_DEBUG("RPC: could not write the reply to" +
+                            node::Log::PeerAddr(mClientIP) + ": " +
+                            ec.message());
+        }
+        Close();
+    }
+
+    void Close() {
+        if (mClosed) return;
+        mClosed = true;
+        boost::system::error_code ec;
+        mTimer.cancel(ec);
+        mSocket->shutdown(tcp::socket::shutdown_both, ec);
+        mSocket->close(ec);
+    }
+
+    RPCServer&                   mServer;
+    std::shared_ptr<tcp::socket> mSocket;
+    asio::steady_timer           mTimer;
+    std::string                  mClientIP;
+    std::array<char, 4096>       mChunk;
+    std::string                  mIn;
+    std::string                  mBody;
+    std::string                  mAuth;
+    size_t                       mHeaderEnd;
+    size_t                       mContentLength;
+    bool                         mHaveContentLength;
+    std::atomic<bool>            mDispatched;
+    std::atomic<bool>            mClosed;
+};
+
 RPCServer::RPCServer(uint16_t port)
     : mAcceptor(mIO)
     , mRunning(false)
@@ -327,6 +830,10 @@ RPCServer::RPCServer(uint16_t port)
     , mWarmupStatus("RPC server starting")
     , mActiveConnections(0)
     , mPort(port)
+    , mBindAddress("127.0.0.1")
+    , mWorkerCount(RPC_DEFAULT_THREADS)
+    , mQueueDepth(RPC_DEFAULT_WORKQUEUE)
+    , mQueueRunning(false)
 {}
 
 RPCServer::~RPCServer() { Stop(); }
@@ -335,101 +842,140 @@ bool RPCServer::Start(
     const RPCContext& context,
     const std::string& rpcUser,
     const std::string& rpcPassword,
-    const std::vector<std::string>& allowedIPs)
+    const std::vector<std::string>& allowedIPs,
+    const std::string& bindAddress,
+    size_t workerThreads,
+    size_t queueDepth)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     if (mRunning) return false;
     if (rpcUser.empty() || rpcPassword.empty()) {
-        std::cerr << "RPCServer: rpcuser and rpcpassword required\n";
+        MONEU_LOG_ERROR("RPC: rpcuser and rpcpassword are both required");
         return false;
     }
     mContext     = context;
     mRPCUser     = rpcUser;
     mRPCPassword = rpcPassword;
-    mAllowedIPs  = allowedIPs;
-    if (mAllowedIPs.empty())
-        mAllowedIPs.push_back("127.0.0.1");
+    mWorkerCount = workerThreads > 0 ? workerThreads : 1;
+    mQueueDepth  = queueDepth > 0 ? queueDepth : 1;
+    mBindAddress = bindAddress.empty() ? std::string("127.0.0.1")
+                                       : bindAddress;
+
+    mAllowedSubnets.clear();
+    for (size_t i = 0; i < allowedIPs.size(); ++i) {
+        RPCSubNet subnet;
+        if (!RPCParseSubNet(allowedIPs[i], subnet)) {
+            MONEU_LOG_ERROR("RPC: rpcallowip entry '" + allowedIPs[i] +
+                            "' is not an address, a network/CIDR or a "
+                            "network/netmask");
+            return false;
+        }
+        mAllowedSubnets.push_back(subnet);
+    }
+    if (mAllowedSubnets.empty()) {
+        RPCSubNet loopback;
+        if (RPCParseSubNet("127.0.0.1", loopback))
+            mAllowedSubnets.push_back(loopback);
+    }
+
     RegisterBuiltinCommands();
     RegisterBlockchainRPCCommands(mTable);
     RegisterNetworkRPCCommands(mTable);
     RegisterWalletRPCCommands(mTable);
     RegisterMiningRPCCommands(mTable);
+
     try {
-        tcp::endpoint endpoint(tcp::v4(), mPort);
+        boost::system::error_code ec;
+        const asio::ip::address addr =
+            asio::ip::make_address(mBindAddress, ec);
+        if (ec) {
+            MONEU_LOG_ERROR("RPC: rpcbind address '" + mBindAddress +
+                            "' cannot be read");
+            return false;
+        }
+        const tcp::endpoint endpoint(addr, mPort);
         mAcceptor.open(endpoint.protocol());
-        mAcceptor.set_option(
-            boost::asio::socket_base::reuse_address(true));
+        mAcceptor.set_option(asio::socket_base::reuse_address(true));
         mAcceptor.bind(endpoint);
         mAcceptor.listen();
-        // Non-blocking mode. AcceptLoop waits on select() with a
-        // timeout. A blocking accept() cannot be woken by cancel() or
-        // close() on Linux, which would leave Stop() joining forever.
-        mAcceptor.non_blocking(true);
+        if (addr.is_unspecified()) {
+            MONEU_LOG_WARN("RPC: the control port is bound to every "
+                           "interface; close it at the firewall unless "
+                           "that is what you meant");
+        }
     } catch (const std::exception& e) {
-        std::cerr << "RPCServer: bind failed on port "
-                  << mPort << ": " << e.what() << "\n";
+        MONEU_LOG_ERROR("RPC: cannot listen on " + mBindAddress + ":" +
+                        std::to_string(mPort) + ": " + e.what());
         return false;
     }
-    mRunning = true;
-    mThreads.emplace_back([this]() { AcceptLoop(); });
+
+    mRunning      = true;
+    mQueueRunning = true;
+
+    mWorkGuard.reset(
+        new asio::executor_work_guard<asio::io_context::executor_type>(
+            asio::make_work_guard(mIO)));
+
+    for (size_t i = 0; i < mWorkerCount; ++i)
+        mWorkers.emplace_back([this]() { WorkerLoop(); });
+
+    StartAccept();
+
+    // One event thread, as in Bitcoin. Everything a connection does outside
+    // Execute() therefore runs on a single thread and needs no lock.
     mThreads.emplace_back([this]() {
         try { mIO.run(); } catch (...) {}
     });
-    std::cerr << "RPCServer: started on port " << mPort << "\n";
+
+    std::string allowed;
+    for (size_t i = 0; i < mAllowedSubnets.size(); ++i) {
+        if (i) allowed += " ";
+        allowed += mAllowedSubnets[i].ToString();
+    }
+    MONEU_LOG_INFO("RPC: listening on " + mBindAddress + ":" +
+                   std::to_string(mPort) + ", " +
+                   std::to_string(mWorkerCount) + " worker threads, " +
+                   "queue depth " + std::to_string(mQueueDepth) +
+                   ", allowed: " + allowed);
     return true;
 }
 
 void RPCServer::Stop() {
-    // Guard based on thread state, NOT mRunning.
-    // Interrupt() sets mRunning=false before Stop(),
-    // so guarding on mRunning would skip join() and cause std::terminate.
-    if (mThreads.empty() && mClientThreads.empty()) return;
+    if (mThreads.empty() && mWorkers.empty()) return;
 
-    // Signal all loops and client handlers to exit
-    mRunning = false;
-    {
-        boost::system::error_code ec;
-        mAcceptor.cancel(ec);
-        mAcceptor.close(ec);
+    Interrupt();
+
+    for (size_t i = 0; i < mWorkers.size(); ++i) {
+        if (mWorkers[i].joinable()) mWorkers[i].join();
     }
-    mCv.notify_all();
-    mIO.stop();
+    mWorkers.clear();
 
-    // Join AcceptLoop + io_context thread FIRST. Once AcceptLoop has
-    // returned, no new entries can be appended to mClientThreads, so
-    // it is then safe to drain that vector without racing emplace_back.
-    for (auto& t : mThreads) {
-        if (t.joinable()) t.join();
+    for (size_t i = 0; i < mThreads.size(); ++i) {
+        if (mThreads[i].joinable()) mThreads[i].join();
     }
     mThreads.clear();
 
-    // Take ownership of the client-thread vector under the lock, then
-    // join the threads OUTSIDE the lock. Holding mCvMutex during join()
-    // could deadlock if a client thread ever needs the same mutex.
-    std::vector<ClientThread> clients;
     {
-        std::lock_guard<std::mutex> lk(mCvMutex);
-        clients.swap(mClientThreads);
-    }
-    for (auto& c : clients) {
-        if (c.thread.joinable()) c.thread.join();
+        std::lock_guard<std::mutex> lock(mQueueMutex);
+        mQueue.clear();
     }
 
-    std::cerr << "RPCServer: stopped\n";
+    MONEU_LOG_INFO("RPC: stopped");
 }
 
 void RPCServer::Interrupt() {
-    // Non-blocking: break all wait states without joining threads.
-    // mIO.stop() here is required: client threads may be parked on
-    // io_context work (timers/handlers), and stopping mIO lets them
-    // unwind so Stop() can join them without hanging.
     mRunning = false;
     {
         boost::system::error_code ec;
         mAcceptor.cancel(ec);
         mAcceptor.close(ec);
     }
-    mCv.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(mQueueMutex);
+        mQueueRunning = false;
+    }
+    mQueueCv.notify_all();
+    if (mWorkGuard) mWorkGuard->reset();
     mIO.stop();
 }
 
@@ -442,287 +988,153 @@ void RPCServer::SetWarmupStatus(const std::string& status) {
 void RPCServer::SetWarmupFinished() {
     std::lock_guard<std::mutex> lock(mMutex);
     mInWarmup = false;
-    std::cerr << "RPCServer: warmup finished\n";
+    MONEU_LOG_INFO("RPC: warmup finished");
 }
 
-void RPCServer::ReapFinishedClients() {
-    std::lock_guard<std::mutex> lk(mCvMutex);
-    auto it = mClientThreads.begin();
-    while (it != mClientThreads.end()) {
-        if (it->done && it->done->load()) {
-            if (it->thread.joinable()) it->thread.join();
-            it = mClientThreads.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-void RPCServer::AcceptLoop() {
-    while (mRunning) {
-        try {
-            ReapFinishedClients();
-            if (!mAcceptor.is_open()) {
-                // Use condition_variable to sleep so
-                // Interrupt() wakes us immediately
-                std::unique_lock<std::mutex> lock(mCvMutex);
-                mCv.wait_for(lock, std::chrono::seconds(1),
-                             [this]() { return !mRunning; });
-                continue;
-            }
-
-            // Wait for a connection with select() and a 500 ms
-            // timeout. The loop then checks mRunning often and ends
-            // within half a second on shutdown, whether or not close()
-            // wakes the syscall. On Linux a blocking accept() is not
-            // woken.
-            int fd = static_cast<int>(mAcceptor.native_handle());
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(fd, &rfds);
-            struct timeval tv = {0, 500000};  // 500 ms
-            int sel = select(fd + 1, &rfds, nullptr, nullptr, &tv);
-            if (!mRunning) break;
-            if (sel <= 0) {
-                // timeout (==0) or EINTR/error (<0): retry the loop.
-                continue;
-            }
-
-            tcp::socket socket(mIO);
-            boost::system::error_code ec;
-            mAcceptor.accept(socket, ec);
-            if (ec) {
-                // would_block means the connection went away between
-                // select() and accept(). That is normal, so retry.
-                if (mRunning &&
-                    ec != boost::asio::error::would_block &&
-                    ec != boost::asio::error::try_again)
-                    std::cerr << "RPCServer: accept error: "
-                              << ec.message() << "\n";
-                // If !mRunning, acceptor was closed - expected
-                continue;
-            }
-            // The socket was accepted in non-blocking mode. Put it
-            // back to blocking mode for the rest of the client work.
-            socket.non_blocking(false, ec);
-            std::string clientIP = socket
-                .remote_endpoint(ec).address().to_string();
-            if (ec) continue;
-            if (!IsIPAllowed(clientIP)) {
-                std::cerr << "RPCServer: rejected IP "
-                          << clientIP << "\n";
-                boost::system::error_code closeEc;
-                socket.close(closeEc);
-                continue;
-            }
-            if (mActiveConnections >= RPC_MAX_CONNECTIONS) {
-                std::cerr << "RPCServer: max connections "
-                             "reached, rejecting "
-                          << clientIP << "\n";
-                boost::system::error_code closeEc;
-                socket.close(closeEc);
-                continue;
-            }
-            mActiveConnections++;
-            auto socketPtr = std::make_shared<tcp::socket>(
-                std::move(socket));
-            auto done = std::make_shared<std::atomic<bool>>(false);
-            // Keep the thread so Stop() can join it. Detached threads
-            // could still touch freed members. The lock guards against
-            // Stop() walking the vector while we append to it.
-            {
-                std::lock_guard<std::mutex> lk(mCvMutex);
-                ClientThread entry;
-                entry.done = done;
-                entry.thread = std::thread(
-                    [this, socketPtr, done]() mutable {
-                        HandleClient(std::move(*socketPtr));
-                        mActiveConnections--;
-                        done->store(true);
-                    }
-                );
-                mClientThreads.push_back(std::move(entry));
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "RPCServer: AcceptLoop exception: "
-                      << e.what() << "\n";
-        }
-    }
-}
-
-void RPCServer::HandleClient(tcp::socket socket) {
-    // Bail out immediately if server is shutting down
+void RPCServer::StartAccept() {
     if (!mRunning) return;
+    auto socket = std::make_shared<tcp::socket>(mIO);
+    mAcceptor.async_accept(
+        *socket,
+        [this, socket](const boost::system::error_code& ec) {
+            OnAccept(socket, ec);
+        });
+}
 
-    try {
-        std::string clientIP =
-            socket.remote_endpoint().address().to_string();
+void RPCServer::OnAccept(std::shared_ptr<tcp::socket> socket,
+                          const boost::system::error_code& ec)
+{
+    if (!mRunning) return;
+    if (ec) {
+        if (ec != asio::error::operation_aborted) {
+            MONEU_LOG_WARN("RPC: accept failed: " + ec.message());
+            StartAccept();
+        }
+        return;
+    }
 
-        // Timeout WITHOUT an async timer on the shared mIO.
-        // Using a steady_timer bound to socket.get_executor() (== mIO)
-        // makes this synchronous handler depend on mIO.run(), which
-        // Stop() halts during shutdown - that caused threads to be
-        // destroyed while joinable (std::terminate). A native socket
-        // receive timeout has no such dependency.
-#ifndef WIN32
+    boost::system::error_code epEc;
+    const tcp::endpoint remote = socket->remote_endpoint(epEc);
+    if (epEc) {
+        boost::system::error_code closeEc;
+        socket->close(closeEc);
+        StartAccept();
+        return;
+    }
+
+    RPCAddrBytes addrBytes;
+    const bool readable = RPCAddressToBytes(remote.address(), addrBytes);
+    const std::string clientIP = remote.address().to_string();
+
+    auto conn = std::make_shared<RPCConnection>(
+        *this, mIO, socket, clientIP);
+
+    if (!readable || !IsAddressAllowed(addrBytes)) {
+        MONEU_LOG_WARN("RPC: refused a connection from an address that is "
+                       "not on the rpcallowip list" +
+                       node::Log::PeerAddr(clientIP));
+        conn->Reject(403, "Client is not allowed control access");
+        StartAccept();
+        return;
+    }
+
+    if (mActiveConnections.load() > RPC_MAX_CONNECTIONS) {
+        MONEU_LOG_WARN("RPC: connection limit of " +
+                       std::to_string(RPC_MAX_CONNECTIONS) +
+                       " reached, refusing" +
+                       node::Log::PeerAddr(clientIP));
+        conn->Reject(503, "Too many control connections");
+        StartAccept();
+        return;
+    }
+
+    conn->Start();
+    StartAccept();
+}
+
+bool RPCServer::EnqueueConnection(
+    const std::shared_ptr<RPCConnection>& conn)
+{
+    {
+        std::lock_guard<std::mutex> lock(mQueueMutex);
+        if (!mQueueRunning) return false;
+        if (mQueue.size() >= mQueueDepth) return false;
+        mQueue.push_back(conn);
+    }
+    mQueueCv.notify_one();
+    return true;
+}
+
+void RPCServer::WorkerLoop() {
+    for (;;) {
+        std::shared_ptr<RPCConnection> conn;
         {
-            struct timeval tv;
-            tv.tv_sec  = RPC_CLIENT_TIMEOUT_SEC;
-            tv.tv_usec = 0;
-            setsockopt(socket.native_handle(), SOL_SOCKET,
-                       SO_RCVTIMEO, &tv, sizeof(tv));
-            setsockopt(socket.native_handle(), SOL_SOCKET,
-                       SO_SNDTIMEO, &tv, sizeof(tv));
+            std::unique_lock<std::mutex> lock(mQueueMutex);
+            while (mQueueRunning && mQueue.empty())
+                mQueueCv.wait(lock);
+            if (!mQueueRunning && mQueue.empty()) return;
+            conn = mQueue.front();
+            mQueue.pop_front();
         }
-#endif
-
-        std::vector<uint8_t> buffer(RPC_MAX_BODY_SIZE);
-        boost::system::error_code ec;
-        size_t bytesRead = socket.read_some(
-            boost::asio::buffer(buffer), ec);
-        if (ec || bytesRead == 0) return;
-        // Check mRunning again after blocking read
-        if (!mRunning) return;
-
-        std::string request(
-            buffer.begin(), buffer.begin() + bytesRead);
-        size_t headerEnd = request.find("\r\n\r\n");
-        if (headerEnd == std::string::npos) return;
-
-        std::string headers = request.substr(0, headerEnd);
-        std::string body    = request.substr(headerEnd + 4);
-
-        std::string authHeader;
-        std::istringstream headerStream(headers);
-        std::string line;
-        bool isPost = false;
-
-        while (std::getline(headerStream, line)) {
-            if (!line.empty() && line.back() == '\r')
-                line.pop_back();
-            if (line.find("POST") == 0)
-                isPost = true;
-            if (line.find("Authorization: Basic ") == 0)
-                authHeader = line.substr(21);
-            if (line.find("Content-Length: ") == 0) {
-                size_t contentLen = 0;
-                try {
-                    contentLen = std::stoul(line.substr(16));
-                } catch (...) { continue; }
-                if (contentLen > RPC_MAX_BODY_SIZE) {
-                    std::string response =
-                        "HTTP/1.1 413 Request Too Large\r\n"
-                        "Content-Length: 0\r\n\r\n";
-                    boost::asio::write(socket,
-                        boost::asio::buffer(response), ec);
-                    return;
-                }
-                if (body.size() < contentLen) {
-                    // No async timer here either - the SO_RCVTIMEO set
-                    // at the top bounds this blocking read as well.
-                    std::vector<uint8_t> extra(
-                        contentLen - body.size());
-                    size_t extraRead = boost::asio::read(
-                        socket,
-                        boost::asio::buffer(extra), ec);
-                    if (!ec && extraRead > 0)
-                        body.append(extra.begin(),
-                            extra.begin() + extraRead);
-                }
-            }
-        }
-
-        if (!isPost) {
-            std::string response =
-                "HTTP/1.1 405 Method Not Allowed\r\n"
-                "Content-Length: 0\r\n\r\n";
-            boost::asio::write(socket,
-                boost::asio::buffer(response), ec);
-            return;
-        }
-        if (!CheckAuth(authHeader)) {
-            std::string response =
-                "HTTP/1.1 401 Unauthorized\r\n"
-                "WWW-Authenticate: Basic realm=\"MONEU\"\r\n"
-                "Content-Length: 0\r\n\r\n";
-            boost::asio::write(socket,
-                boost::asio::buffer(response), ec);
-            return;
-        }
-        if (body.empty()) {
-            std::string response =
-                "HTTP/1.1 400 Bad Request\r\n"
-                "Content-Length: 0\r\n\r\n";
-            boost::asio::write(socket,
-                boost::asio::buffer(response), ec);
-            return;
-        }
-
-        std::string responseBody;
+        if (!conn) continue;
         try {
-            json parsed = json::parse(body);
-            if (parsed.is_array()) {
-                responseBody =
-                    ProcessBatch(parsed, clientIP);
-            } else {
-                RPCRequest rpcReq;
-                rpcReq.clientIP = clientIP;
-                if (!ParseRequest(body, rpcReq)) {
-                    responseBody = RPCResponse::Error(
-                        RPC_PARSE_ERROR, "Parse error",
-                        nullptr).ToJson().dump();
-                } else {
-                    RPCResponse rpcResp;
-                    if (mInWarmup) {
-                        std::string warmupMsg;
-                        {
-                            std::lock_guard<std::mutex> lk(
-                                mMutex);
-                            warmupMsg = mWarmupStatus;
-                        }
-                        rpcResp = RPCResponse::Error(
-                            RPC_IN_WARMUP,
-                            "Server in warmup: " + warmupMsg,
-                            rpcReq.id);
-                    } else {
-                        try {
-                            json result = mTable.Execute(
-                                rpcReq, mContext);
-                            rpcResp = RPCResponse::Success(
-                                result, rpcReq.id);
-                        } catch (const RPCError& e) {
-                            rpcResp = RPCResponse::Error(
-                                e.code, e.what(), rpcReq.id);
-                        } catch (const std::exception& e) {
-                            rpcResp = RPCResponse::Error(
-                                RPC_INTERNAL_ERROR,
-                                e.what(), rpcReq.id);
-                        }
-                    }
-                    responseBody = rpcResp.ToJson().dump();
-                }
+            conn->Execute();
+        } catch (const std::exception& e) {
+            MONEU_LOG_ERROR(std::string("RPC: worker caught: ") + e.what());
+        }
+    }
+}
+
+std::string RPCServer::BuildResponseBody(const std::string& body,
+                                          const std::string& clientIP)
+{
+    try {
+        const json parsed = json::parse(body);
+        if (parsed.is_array()) {
+            if (parsed.empty()) {
+                return RPCResponse::Error(
+                    RPC_INVALID_REQUEST, "Empty batch",
+                    nullptr).ToJson().dump();
             }
-        } catch (const json::exception& e) {
-            responseBody = RPCResponse::Error(
-                RPC_PARSE_ERROR,
-                "JSON parse error: " +
-                std::string(e.what()),
+            return ProcessBatch(parsed, clientIP);
+        }
+
+        RPCRequest request;
+        request.clientIP = clientIP;
+        if (!ParseRequest(body, request)) {
+            return RPCResponse::Error(
+                RPC_INVALID_REQUEST, "Invalid request",
                 nullptr).ToJson().dump();
         }
 
-        std::string httpResponse =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: " +
-            std::to_string(responseBody.size()) +
-            "\r\nConnection: close\r\n\r\n" +
-            responseBody;
-        boost::asio::write(socket,
-            boost::asio::buffer(httpResponse), ec);
+        if (mInWarmup) {
+            std::string warmupMsg;
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                warmupMsg = mWarmupStatus;
+            }
+            return RPCResponse::Error(
+                RPC_IN_WARMUP, "Server in warmup: " + warmupMsg,
+                request.id).ToJson().dump();
+        }
 
-    } catch (const std::exception& e) {
-        std::cerr << "RPCServer: HandleClient exception: "
-                  << e.what() << "\n";
+        try {
+            const json result = mTable.Execute(request, mContext);
+            return RPCResponse::Success(result, request.id)
+                .ToJson().dump();
+        } catch (const RPCError& e) {
+            return RPCResponse::Error(e.code, e.what(), request.id)
+                .ToJson().dump();
+        } catch (const std::exception& e) {
+            return RPCResponse::Error(
+                RPC_INTERNAL_ERROR, e.what(), request.id)
+                .ToJson().dump();
+        }
+    } catch (const json::exception& e) {
+        return RPCResponse::Error(
+            RPC_PARSE_ERROR,
+            std::string("JSON parse error: ") + e.what(),
+            nullptr).ToJson().dump();
     }
 }
 
@@ -801,14 +1213,18 @@ bool RPCServer::CheckAuth(
     if (colonPos == std::string::npos) return false;
     if (colonPos == 0 ||
         colonPos == decoded.size() - 1) return false;
-    return (decoded.substr(0, colonPos) == mRPCUser &&
-            decoded.substr(colonPos + 1) == mRPCPassword);
+    // Both halves are compared in full and combined afterwards, so neither
+    // can be probed one byte at a time by timing the answer.
+    const bool userOk =
+        TimingSafeEqual(decoded.substr(0, colonPos), mRPCUser);
+    const bool passOk =
+        TimingSafeEqual(decoded.substr(colonPos + 1), mRPCPassword);
+    return userOk && passOk;
 }
 
-bool RPCServer::IsIPAllowed(const std::string& ip) const {
-    for (const auto& allowed : mAllowedIPs) {
-        if (allowed == ip || allowed == "0.0.0.0")
-            return true;
+bool RPCServer::IsAddressAllowed(const RPCAddrBytes& addr) const {
+    for (size_t i = 0; i < mAllowedSubnets.size(); ++i) {
+        if (mAllowedSubnets[i].Match(addr)) return true;
     }
     return false;
 }
@@ -1026,7 +1442,7 @@ void RPCServer::RegisterBuiltinCommands() {
         "control", "stop",
         "stop - Gracefully stop the MONEU node",
         [](const RPCRequest&, const RPCContext&) -> json {
-            std::cerr << "RPCServer: stop requested\n";
+            MONEU_LOG_INFO("RPC: stop requested");
             std::thread([]() {
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(200));

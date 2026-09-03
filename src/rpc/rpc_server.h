@@ -17,10 +17,13 @@
 
 #include <string>
 #include <vector>
+#include <deque>
 #include <map>
+#include <array>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -38,10 +41,7 @@ namespace asio = boost::asio;
 using tcp = boost::asio::ip::tcp;
 
 static const uint16_t RPC_PORT               = NetParams::RPC_PORT;
-// Must hold the largest legal block as hex, which is two characters per
-// byte, plus the JSON around it. A limit below that would make the biggest
-// valid blocks unsubmittable while doing nothing about abuse, since a
-// smaller flood is just as effective at wasting parsing time.
+
 // How long an identical getblocktemplate request returns the same answer.
 //
 // A template stays usable until the tip moves, which the cache also checks,
@@ -49,10 +49,24 @@ static const uint16_t RPC_PORT               = NetParams::RPC_PORT;
 // caller asking in a tight loop.
 static const int64_t  GETBLOCKTEMPLATE_CACHE_SEC = 5;
 
+// A limit, not an allocation: the reader reserves what Content-Length
+// declares. Must hold the largest legal block as hex plus the JSON around it.
 static const uint32_t RPC_MAX_BODY_SIZE =
     NetParams::MAX_BLOCK_SIZE * 2 + 4096;
+
+static const uint32_t RPC_MAX_HEADERS_SIZE    = 8192;
+
 static const uint32_t RPC_MAX_CONNECTIONS     = 20;
-static const uint32_t RPC_CLIENT_TIMEOUT_SEC  = 10;
+
+// Deadline for reading a request. Cancelled once the request is complete, so
+// a slow command is never cut off half-way through.
+static const uint32_t RPC_CLIENT_TIMEOUT_SEC  = 30;
+
+// Bitcoin's -rpcthreads and -rpcworkqueue. The queue is as deep as the
+// connection limit, so a caller admitted by the limit is never refused again.
+static const size_t   RPC_DEFAULT_THREADS     = 4;
+static const size_t   RPC_DEFAULT_WORKQUEUE   = RPC_MAX_CONNECTIONS;
+
 static const uint32_t PROTOCOL_VERSION        = 1;
 
 class RPCError : public std::runtime_error {
@@ -78,6 +92,33 @@ enum RPCErrorCode {
     // Standard Bitcoin RPC code for a bad or unknown address/key.
     RPC_INVALID_ADDRESS_OR_KEY = -5
 };
+
+// Four bytes for IPv4, sixteen for IPv6. An IPv4-mapped IPv6 address is
+// folded back to IPv4 so a dual-stack socket matches the same rules.
+struct RPCAddrBytes {
+    bool                    isV6;
+    std::array<uint8_t, 16> bytes;
+
+    RPCAddrBytes() : isV6(false) { bytes.fill(0); }
+};
+
+// One rpcallowip entry: a bare address, a CIDR prefix, or a dotted netmask.
+struct RPCSubNet {
+    bool                    isV6;
+    std::array<uint8_t, 16> network;
+    std::array<uint8_t, 16> netmask;
+
+    RPCSubNet() : isV6(false) {
+        network.fill(0);
+        netmask.fill(0);
+    }
+
+    bool Match(const RPCAddrBytes& addr) const;
+    std::string ToString() const;
+};
+
+bool RPCAddressToBytes(const asio::ip::address& addr, RPCAddrBytes& out);
+bool RPCParseSubNet(const std::string& text, RPCSubNet& out);
 
 struct RPCRequest {
     std::string method;
@@ -145,11 +186,6 @@ struct RPCContext {
     node::WalletManager*      wallet;
     node::Miner*              miner;
 
-    // Publishes reveals for transactions already held on chain. The node
-    // otherwise only tries this when a block connects, so a wallet
-    // unlocked inside the six-block window would sit on a usable proof
-    // until the next block instead of sending it at once.
-
     RPCContext()
         : chainState(nullptr)
         , mempool(nullptr)
@@ -202,9 +238,19 @@ public:
     bool HasCommand(const std::string& name) const;
 };
 
+class RPCConnection;
+
+// One event thread accepts and reads without blocking, complete requests go
+// into a bounded queue, and a fixed pool of workers runs the commands. A slow
+// command holds one worker; a half-sent request holds none.
+//
+// Every path out answers the caller. None closes a socket in silence.
 class RPCServer {
 private:
     asio::io_context            mIO;
+    std::unique_ptr<
+        asio::executor_work_guard<
+            asio::io_context::executor_type> > mWorkGuard;
     tcp::acceptor               mAcceptor;
     mutable std::mutex          mMutex;
     std::atomic<bool>           mRunning;
@@ -213,27 +259,32 @@ private:
     std::atomic<uint32_t>       mActiveConnections;
     std::string                 mRPCUser;
     std::string                 mRPCPassword;
-    std::vector<std::string>    mAllowedIPs;
+    std::vector<RPCSubNet>      mAllowedSubnets;
     RPCTable                    mTable;
     RPCContext                  mContext;
     std::vector<std::thread>    mThreads;
+    std::vector<std::thread>    mWorkers;
     uint16_t                    mPort;
+    std::string                 mBindAddress;
+    size_t                      mWorkerCount;
+    size_t                      mQueueDepth;
 
-    // Shutdown synchronization - wakes sleeping loops on Interrupt()
-    std::condition_variable     mCv;
-    std::mutex                  mCvMutex;
-    // Client threads are joined during Stop(). Each one sets a flag when it
-    // ends so the accept loop can join and drop finished entries.
-    struct ClientThread {
-        std::thread                        thread;
-        std::shared_ptr<std::atomic<bool>> done;
-    };
-    std::vector<ClientThread>   mClientThreads;
+    std::mutex                                  mQueueMutex;
+    std::condition_variable                     mQueueCv;
+    std::deque<std::shared_ptr<RPCConnection> > mQueue;
+    bool                                        mQueueRunning;
 
-    void ReapFinishedClients();
+    void StartAccept();
+    void OnAccept(std::shared_ptr<tcp::socket> socket,
+                  const boost::system::error_code& ec);
+    void WorkerLoop();
 
-    void AcceptLoop();
-    void HandleClient(tcp::socket socket);
+    // False when the queue is full: answer 503, do not drop the connection.
+    bool EnqueueConnection(const std::shared_ptr<RPCConnection>& conn);
+
+    // Runs on a worker thread.
+    std::string BuildResponseBody(const std::string& body,
+                                  const std::string& clientIP);
 
     bool ParseRequest(const std::string& body,
                        RPCRequest& request);
@@ -243,11 +294,13 @@ private:
         const std::string& clientIP);
 
     bool CheckAuth(const std::string& authHeader) const;
-    bool IsIPAllowed(const std::string& ip) const;
+    bool IsAddressAllowed(const RPCAddrBytes& addr) const;
 
     void RegisterBuiltinCommands();
 
     static std::string Base64Decode(const std::string& in);
+
+    friend class RPCConnection;
 
 public:
     explicit RPCServer(uint16_t port = RPC_PORT);
@@ -256,10 +309,14 @@ public:
     RPCServer(const RPCServer&) = delete;
     RPCServer& operator=(const RPCServer&) = delete;
 
+    // The caller decides bindAddress; this class never widens it.
     bool Start(const RPCContext& context,
                const std::string& rpcUser,
                const std::string& rpcPassword,
-               const std::vector<std::string>& allowedIPs);
+               const std::vector<std::string>& allowedIPs,
+               const std::string& bindAddress,
+               size_t workerThreads = RPC_DEFAULT_THREADS,
+               size_t queueDepth = RPC_DEFAULT_WORKQUEUE);
 
     void Stop();
     void Interrupt();

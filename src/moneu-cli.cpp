@@ -34,6 +34,8 @@ static std::string gRPCUser     = "";
 static std::string gRPCPassword = "";
 static std::string gDataDir     = "";
 static bool        gPretty      = true;
+// Bitcoin's -rpcclienttimeout, same default.
+static long        gRPCClientTimeout = 900;
 
 static const std::string B64_CHARS =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -43,9 +45,13 @@ static std::string Base64Encode(
     const std::string& in)
 {
     std::string out;
-    int val = 0, valb = -6;
+    // Unsigned and masked to the bits still owed to the output. As a signed
+    // int shifted left without a mask this overflowed past three characters,
+    // which is undefined behaviour on the path that builds the credentials.
+    uint32_t val = 0;
+    int valb = -6;
     for (unsigned char c : in) {
-        val = (val << 8) + c;
+        val = ((val << 8) | static_cast<uint32_t>(c)) & 0x00FFFFFFu;
         valb += 8;
         while (valb >= 0) {
             out.push_back(
@@ -136,8 +142,11 @@ static std::string SendRPCRequest(
         exit(1);
     }
 
+    // Bitcoin's -rpcclienttimeout default. Ten seconds was enough for an
+    // idle node and not for a busy one: the client gave up while the node
+    // was still working and called the reply unreadable.
     struct timeval tv;
-    tv.tv_sec  = 10;
+    tv.tv_sec  = gRPCClientTimeout;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
                &tv, sizeof(tv));
@@ -191,6 +200,7 @@ static std::string SendRPCRequest(
     std::string response;
     char buf[4096];
     ssize_t n;
+    bool timedOut = false;
     while (true) {
         n = recv(sock, buf, sizeof(buf), 0);
         if (n > 0) {
@@ -198,16 +208,48 @@ static std::string SendRPCRequest(
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            timedOut = true;
         break;
     }
     close(sock);
 
-    size_t bodyStart = response.find("\r\n\r\n");
-    if (bodyStart == std::string::npos) {
-        std::cerr << "error: invalid HTTP response\n";
+    // Three different failures used to print the same line.
+    if (response.empty()) {
+        if (timedOut) {
+            std::cerr << "error: no reply within "
+                      << gRPCClientTimeout << " s\n"
+                      << "The node accepted the connection and did not "
+                         "answer. Raise the wait with "
+                         "-rpcclienttimeout=<seconds>.\n";
+        } else {
+            std::cerr << "error: the node closed the connection without "
+                         "replying\n"
+                      << "Check " << GetDefaultDataDir()
+                      << "/logs/moneu.log for the reason.\n";
+        }
         exit(1);
     }
-    return response.substr(bodyStart + 4);
+
+    size_t bodyStart = response.find("\r\n\r\n");
+    if (bodyStart == std::string::npos) {
+        std::cerr << "error: the reply was cut off after "
+                  << response.size() << " bytes\n";
+        exit(1);
+    }
+
+    // A refusal carries its reason in the status line and in a JSON body.
+    // The status is reported when the body cannot explain itself.
+    std::string statusLine = response.substr(0, response.find("\r\n"));
+    std::string replyBody = response.substr(bodyStart + 4);
+    if (statusLine.size() > 12 &&
+        statusLine.compare(0, 9, "HTTP/1.1 ") == 0 &&
+        statusLine.compare(9, 3, "200") != 0 &&
+        replyBody.empty()) {
+        std::cerr << "error: " << statusLine << "\n";
+        exit(1);
+    }
+    return replyBody;
 }
 
 static json CallRPC(
@@ -529,6 +571,14 @@ int main(int argc, char* argv[]) {
             gRPCHost = arg.substr(9);
         } else if (arg.find("-datadir=") == 0) {
             gDataDir = arg.substr(9);
+        } else if (arg.find("-rpcclienttimeout=") == 0) {
+            const long secs = std::atol(arg.substr(18).c_str());
+            if (secs <= 0) {
+                std::cerr << "error: -rpcclienttimeout must be a positive "
+                             "number of seconds\n";
+                return 1;
+            }
+            gRPCClientTimeout = secs;
         } else if (arg == "-compact") {
             gPretty = false;
         } else {

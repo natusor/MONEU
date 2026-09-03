@@ -233,14 +233,34 @@ static bool InitLogger(
 
     if (gLogToFile) {
         const fs::path logPath = dataDir.GetLogFilePath();
+        // cfg.maxLogSize is already in bytes. Multiplying again here turned
+        // a 10 MB limit into 10 TB and the file grew without bound.
         if (!node::Log::OpenFile(logPath,
-                                 static_cast<uint64_t>(cfg.maxLogSize) *
-                                 1024 * 1024)) {
+                                 static_cast<uint64_t>(cfg.maxLogSize))) {
             std::cerr << "WARNING: cannot open log file "
                       << logPath.string() << "\n";
         }
     }
     return true;
+}
+
+// Bitcoin's rule: the loopback unless the config names both an address to
+// bind and the addresses allowed to reach it. One without the other is a
+// half-written intention, and the safe half is to stay on the loopback.
+static std::string ResolveRPCBindAddress(const node::RPCConfig& rpc) {
+    if (!rpc.rpcAllowIpSet) {
+        if (rpc.rpcBindSet) {
+            LOG_WARN("rpcbind was ignored because rpcallowip is not set; "
+                     "the control port stays on 127.0.0.1");
+        }
+        return "127.0.0.1";
+    }
+    if (!rpc.rpcBindSet) {
+        LOG_WARN("rpcallowip is set without rpcbind; the control port "
+                 "stays on 127.0.0.1");
+        return "127.0.0.1";
+    }
+    return rpc.rpcBindAddr;
 }
 
 static std::string GenerateRPCCookie() {
@@ -952,7 +972,8 @@ int main(int argc, char* argv[]) {
                     rpcContext,
                     node.config.GetRPC().rpcUser,
                     node.config.GetRPC().rpcPassword,
-                    allowedIPs)) {
+                    allowedIPs,
+                    ResolveRPCBindAddress(node.config.GetRPC()))) {
                 LOG_ERROR("FATAL: RPC start failed");
                 return 1;
             }
@@ -994,7 +1015,8 @@ int main(int argc, char* argv[]) {
 
             node.rpcServer->SetWarmupStatus("Initializing...");
             if (!node.rpcServer->Start(
-                    rpcContext, "__cookie__", cookie, allowedIPs)) {
+                    rpcContext, "__cookie__", cookie, allowedIPs,
+                    "127.0.0.1")) {
                 LOG_ERROR("FATAL: RPC start failed");
                 return 1;
             }
