@@ -88,6 +88,7 @@ ChainState::ChainState(const fs::path& dataDir,
 bool ChainState::LoadBestChain() {
     if (!mDB->Read(DB_CHAIN_BEST, mBestChain)) {
         mBestChain = ChainTip();
+        mChainByHeight.clear();
         return false;
     }
     return true;
@@ -155,10 +156,46 @@ bool ChainState::Initialize() {
     }
 
     mInitialized = true;
+    BuildHeightIndexLocked();
     MONEU_LOG_INFO("ChainState: initialized at height " +
                    std::to_string(mBestChain.height) +
                    " tip=" + HexOf(mBestChain.blockHash));
     return true;
+}
+
+void ChainState::BuildHeightIndexLocked() {
+    mChainByHeight.clear();
+    bool allZero = true;
+    for (uint8_t b : mBestChain.blockHash) {
+        if (b != 0) { allZero = false; break; }
+    }
+    if (allZero) return;
+
+    std::vector<bytes32> reversed;
+    reversed.reserve(static_cast<size_t>(mBestChain.height) + 1);
+
+    bytes32 cursor = mBestChain.blockHash;
+    uint32_t h = mBestChain.height;
+    for (;;) {
+        reversed.push_back(cursor);
+        if (h == 0) break;
+        BlockIndexEntry entry;
+        if (!mBlockData->ReadBlockIndex(cursor, entry)) {
+            // The walk broke before genesis, so the index would have holes.
+            // GetBlockHashByHeightLocked falls back to walking the block
+            // index when the table is short, so leaving it empty costs
+            // speed and nothing else.
+            MONEU_LOG_WARN("ChainState: could not walk the chain back to "
+                           "genesis while building the height index; "
+                           "height lookups will use the slow path");
+            mChainByHeight.clear();
+            return;
+        }
+        cursor = entry.hashPrev;
+        h--;
+    }
+
+    mChainByHeight.assign(reversed.rbegin(), reversed.rend());
 }
 
 bool ChainState::InitializeGenesisLocked() {
@@ -210,6 +247,9 @@ bool ChainState::InitializeGenesisLocked() {
     mBestChain.timestamp = hdr.GetTimestamp();
     mBestChain.bits      = hdr.GetBits();
     mBestChain.chainWork = chainWork;
+
+    mChainByHeight.clear();
+    mChainByHeight.push_back(genesisHash);
 
     mDB->Write(DB_CHAIN_BEST, mBestChain);
     mDB->Write(DB_CHAIN_GENESIS, genesisHash);
@@ -819,6 +859,12 @@ bool ChainState::ConnectBlockLocked(const Block& block)
     mBestChain.bits      = hdr.GetBits();
     mBestChain.chainWork = chainWork;
 
+    if (mChainByHeight.size() == newHeight) {
+        mChainByHeight.push_back(blockHash);
+    } else {
+        mChainByHeight.clear();
+    }
+
     if (!mDB->Write(DB_CHAIN_BEST, mBestChain, true)) {
         MONEU_LOG_ERROR("ChainState: could not record the new tip at "
                         "height " + std::to_string(newHeight) +
@@ -909,6 +955,13 @@ bool ChainState::DisconnectTipLocked()
         mBestChain.timestamp = parent.nTime;
         mBestChain.bits      = parent.nBits;
         mBestChain.chainWork = parent.nChainWork;
+
+        if (mChainByHeight.size() ==
+            static_cast<size_t>(parent.nHeight) + 2) {
+            mChainByHeight.pop_back();
+        } else {
+            mChainByHeight.clear();
+        }
     } else {
         std::cerr << "ChainState: DisconnectBlock - parent "
                      "missing from the block index, chain state is "
@@ -1292,11 +1345,37 @@ std::vector<bytes32> ChainState::GetBlockHashesAfter(const bytes32& after,
     if (!GetBlockHashByHeightLocked(fromHeight, atSameHeight)) return out;
     if (!(atSameHeight == after)) return out;
 
-    for (uint32_t h = fromHeight + 1;
-         h <= mBestChain.height && out.size() < max; ++h) {
-        bytes32 hash;
-        if (!GetBlockHashByHeightLocked(h, hash)) break;
-        out.push_back(hash);
+    const size_t want = (mBestChain.height > fromHeight)
+        ? static_cast<size_t>(mBestChain.height - fromHeight)
+        : 0u;
+    if (want == 0) return out;
+    out.reserve(want < max ? want : max);
+
+    if (mChainByHeight.size() == static_cast<size_t>(mBestChain.height) + 1) {
+        for (uint32_t h = fromHeight + 1;
+             h <= mBestChain.height && out.size() < max; ++h) {
+            out.push_back(mChainByHeight[h]);
+        }
+        return out;
+    }
+
+    // Without the table, collect the tail once and read it forwards, rather
+    // than walking down from the tip again for every single height.
+    std::vector<bytes32> reversed;
+    reversed.reserve(want);
+    bytes32 cursor = mBestChain.blockHash;
+    uint32_t h = mBestChain.height;
+    while (h > fromHeight) {
+        reversed.push_back(cursor);
+        BlockIndexEntry entry;
+        if (!mBlockData->ReadBlockIndex(cursor, entry)) return out;
+        cursor = entry.hashPrev;
+        h--;
+    }
+    if (!(cursor == after)) return out;
+
+    for (size_t i = reversed.size(); i > 0 && out.size() < max; --i) {
+        out.push_back(reversed[i - 1]);
     }
     return out;
 }
@@ -1347,6 +1426,14 @@ bool ChainState::GetBlockHashByHeightLocked(uint32_t height,
         return true;
     }
 
+    if (mChainByHeight.size() > height &&
+        mChainByHeight.size() == static_cast<size_t>(mBestChain.height) + 1) {
+        hashOut = mChainByHeight[height];
+        return true;
+    }
+
+    // The table is missing or out of step with the tip, so fall back to
+    // walking the block index. Correctness never depends on the table.
     bytes32 cursor = mBestChain.blockHash;
     uint32_t h = mBestChain.height;
     while (h > height) {

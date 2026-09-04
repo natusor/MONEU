@@ -57,6 +57,17 @@ private:
     ChainTip                   mBestChain;
     bool                       mInitialized;
 
+    // Hash of every block on the active chain, indexed by height, the way
+    // Bitcoin's CChain holds vChain. Built once at startup and kept in step
+    // with mBestChain, so asking for the hash at a height is one lookup
+    // instead of a walk back from the tip reading the block index at every
+    // step. Nothing is stored on disk for it.
+    std::vector<bytes32>       mChainByHeight;
+
+    // Walks back from the tip and fills mChainByHeight. Called with mMutex
+    // held, after the tip is known.
+    void BuildHeightIndexLocked();
+
     bool LoadBestChain();
     bool VerifyGenesisBlock() const;
 
