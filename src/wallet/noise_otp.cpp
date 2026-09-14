@@ -299,6 +299,13 @@ bool NoiseFile::VerifyProof(const bytes32& root,
         if (proof.pathDirs[i] > 1) return false;
     }
 
+    size_t walk = proof.leafIndex;
+    for (size_t i = 0; i < proof.pathDirs.size(); ++i) {
+        const uint8_t expected = (walk % 2 == 0) ? 0 : 1;
+        if (proof.pathDirs[i] != expected) return false;
+        walk /= 2;
+    }
+
     bytes32 expectedBound = BindLeafToTx(proof.leaf, txHash);
     if (std::memcmp(expectedBound.data(), proof.boundProof.data(), 32) != 0) {
         return false;
