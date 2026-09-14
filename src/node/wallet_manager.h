@@ -124,6 +124,7 @@ private:
     // corrected against the chain by SyncNoiseLeafPointer, which is what
     // covers a wallet whose noise file came back from a backup copy.
     uint32_t                   mNoiseNextLeaf;
+    std::vector<uint8_t>       mNoiseUsed;
 
     // Outpoint -> id of the pending transaction that took it. Cleared for
     // one transaction by ReleaseOutpointsFor when it confirms or is
@@ -151,7 +152,11 @@ private:
     // an AES-encrypted entropy field; version 1 files are not readable.
     // Version 4 stores proofs prepared for transactions awaiting their
     // reveal; version 3 stored the leaf pointer; version 2 neither.
-    static const uint32_t WALLET_VERSION    = 4;
+    // Version 5 replaces the leaf pointer with a map of consumed leaves,
+    // because leaves are now picked by the transaction rather than in
+    // order. A version 4 file is read once and rewritten as version 5.
+    static const uint32_t WALLET_VERSION     = 5;
+    static const uint32_t WALLET_VERSION_OLD = 4;
     static const uint32_t PBKDF2_ITERATIONS =
         crypto::ENC_PBKDF2_ITERATIONS;
     static const uint32_t SALT_SIZE         = 32;
@@ -186,6 +191,8 @@ private:
     static bool EntropyToSeed(const std::vector<uint8_t>& entropy,
                               uint8_t seedOut[64]);
 
+    bool IsNoiseLeafUsed(uint32_t index) const;
+    void MarkNoiseLeafUsed(uint32_t index);
     bool SaveToFile() const;
     bool LoadFromFile();
 

@@ -347,38 +347,77 @@ bool TxValidation::VerifyTransactionSignatures(
             return false;
         }
         try {
+            const std::vector<uint32_t> wanted = DeriveLeafIndices(
+                tx.GetHash(),
+                input.GetKps(),
+                NetParams::NOISE_PROOFS_PER_INPUT,
+                NetParams::NOISE_LEAF_COUNT);
+
+            for (size_t a = 0; a + 1 < wanted.size(); ++a) {
+                for (size_t b = a + 1; b < wanted.size(); ++b) {
+                    if (wanted[a] == wanted[b]) {
+                        state.SetInvalid(
+                            TxValidationResult::INVALID_NOISE_PROOF,
+                            "Input " + std::to_string(i) +
+                            " derives a repeated leaf index"
+                        );
+                        return false;
+                    }
+                }
+            }
+
             size_t proofOffset = 0;
-            NoiseProof proof = NoiseProof::Deserialize(
-                proofBytes.data(), proofBytes.size(), proofOffset);
+            for (size_t j = 0; j < wanted.size(); ++j) {
+                NoiseProof proof = NoiseProof::Deserialize(
+                    proofBytes.data(), proofBytes.size(), proofOffset);
 
-            if (!NoiseFile::VerifyProof(
-                    input.GetKps(),
-                    tx.GetHash(),
-                    proof,
-                    NetParams::NOISE_LEAF_COUNT)) {
-                state.SetInvalid(
-                    TxValidationResult::INVALID_NOISE_PROOF,
-                    "Input " + std::to_string(i) +
-                    " has an invalid noise proof"
-                );
-                return false;
+                if (proof.leafIndex != wanted[j]) {
+                    state.SetInvalid(
+                        TxValidationResult::INVALID_NOISE_PROOF,
+                        "Input " + std::to_string(i) +
+                        " carries a leaf the transaction does not call for"
+                    );
+                    return false;
+                }
+
+                if (!NoiseFile::VerifyProof(
+                        input.GetKps(),
+                        tx.GetHash(),
+                        proof,
+                        NetParams::NOISE_LEAF_COUNT)) {
+                    state.SetInvalid(
+                        TxValidationResult::INVALID_NOISE_PROOF,
+                        "Input " + std::to_string(i) +
+                        " has an invalid noise proof"
+                    );
+                    return false;
+                }
+
+                const std::pair<bytes32, uint32_t> leafId(input.GetKps(),
+                                                          proof.leafIndex);
+                if (!leafScope.insert(leafId).second) {
+                    state.SetInvalid(
+                        TxValidationResult::INVALID_NOISE_PROOF,
+                        "Input " + std::to_string(i) +
+                        " reuses a leaf already claimed here"
+                    );
+                    return false;
+                }
+                if (utxoSet.IsNoiseLeafSpent(input.GetKps(), proof.leafIndex)) {
+                    state.SetInvalid(
+                        TxValidationResult::INVALID_NOISE_PROOF,
+                        "Input " + std::to_string(i) +
+                        " uses a leaf that is already spent"
+                    );
+                    return false;
+                }
             }
 
-            const std::pair<bytes32, uint32_t> leafId(input.GetKps(),
-                                                      proof.leafIndex);
-            if (!leafScope.insert(leafId).second) {
+            if (proofOffset != proofBytes.size()) {
                 state.SetInvalid(
                     TxValidationResult::INVALID_NOISE_PROOF,
                     "Input " + std::to_string(i) +
-                    " reuses a leaf already claimed here"
-                );
-                return false;
-            }
-            if (utxoSet.IsNoiseLeafSpent(input.GetKps(), proof.leafIndex)) {
-                state.SetInvalid(
-                    TxValidationResult::INVALID_NOISE_PROOF,
-                    "Input " + std::to_string(i) +
-                    " uses a leaf that is already spent"
+                    " carries trailing bytes after its noise proofs"
                 );
                 return false;
             }

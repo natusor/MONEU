@@ -28,15 +28,17 @@ bool Mempool::ExtractLeafKeys(const Transaction& tx,
         if (proofBytes.empty()) continue;
         try {
             size_t offset = 0;
-            NoiseProof proof = NoiseProof::Deserialize(
-                proofBytes.data(), proofBytes.size(), offset);
-            std::string key(reinterpret_cast<const char*>(
-                                input.GetKps().data()), 32);
-            key.push_back(static_cast<char>(proof.leafIndex & 0xFF));
-            key.push_back(static_cast<char>((proof.leafIndex >> 8) & 0xFF));
-            key.push_back(static_cast<char>((proof.leafIndex >> 16) & 0xFF));
-            key.push_back(static_cast<char>((proof.leafIndex >> 24) & 0xFF));
-            leafKeys.push_back(std::move(key));
+            while (offset < proofBytes.size()) {
+                NoiseProof proof = NoiseProof::Deserialize(
+                    proofBytes.data(), proofBytes.size(), offset);
+                std::string key(reinterpret_cast<const char*>(
+                                    input.GetKps().data()), 32);
+                key.push_back(static_cast<char>(proof.leafIndex & 0xFF));
+                key.push_back(static_cast<char>((proof.leafIndex >> 8) & 0xFF));
+                key.push_back(static_cast<char>((proof.leafIndex >> 16) & 0xFF));
+                key.push_back(static_cast<char>((proof.leafIndex >> 24) & 0xFF));
+                leafKeys.push_back(std::move(key));
+            }
         } catch (const std::exception&) {
             return false;
         }

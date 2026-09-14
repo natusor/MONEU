@@ -135,6 +135,7 @@ NoiseFile::NoiseFile(const NoiseFile& other)
     , mLevels(other.mLevels)
     , mRoot(other.mRoot)
     , mNextLeaf(other.mNextLeaf)
+    , mUsed(other.mUsed)
 {}
 
 NoiseFile::NoiseFile(NoiseFile&& other)
@@ -142,11 +143,13 @@ NoiseFile::NoiseFile(NoiseFile&& other)
     , mLevels(std::move(other.mLevels))
     , mRoot(other.mRoot)
     , mNextLeaf(other.mNextLeaf)
+    , mUsed(other.mUsed)
 {
     other.mLeaves.clear();
     other.mLevels.clear();
     other.mRoot.fill(0);
     other.mNextLeaf = 0;
+    other.mUsed.clear();
 }
 
 NoiseFile& NoiseFile::operator=(NoiseFile&& other) {
@@ -156,10 +159,12 @@ NoiseFile& NoiseFile::operator=(NoiseFile&& other) {
         mLevels   = std::move(other.mLevels);
         mRoot     = other.mRoot;
         mNextLeaf = other.mNextLeaf;
+        mUsed = other.mUsed;
         other.mLeaves.clear();
         other.mLevels.clear();
         other.mRoot.fill(0);
         other.mNextLeaf = 0;
+        other.mUsed.clear();
     }
     return *this;
 }
@@ -171,6 +176,7 @@ NoiseFile& NoiseFile::operator=(const NoiseFile& other) {
         mLevels   = other.mLevels;
         mRoot     = other.mRoot;
         mNextLeaf = other.mNextLeaf;
+        mUsed = other.mUsed;
     }
     return *this;
 }
@@ -188,6 +194,7 @@ void NoiseFile::Wipe() {
     mLevels.clear();
     mRoot.fill(0);
     mNextLeaf = 0;
+    mUsed.clear();
 }
 
 void NoiseFile::BuildTree() {
@@ -239,6 +246,7 @@ NoiseFile NoiseFile::Generate(const std::vector<uint8_t>& rawNoise, uint32_t lea
     memzero(buf, sizeof(buf));
     nf.BuildTree();
     nf.mNextLeaf = 0;
+    nf.mUsed.assign((nf.mLeaves.size() + 7) / 8, 0);
     return nf;
 }
 
@@ -251,15 +259,15 @@ void NoiseFile::SetNextLeaf(uint32_t next) {
     }
 }
 
-NoiseProof NoiseFile::CreateProof(const bytes32& txHash) {
-    if (mNextLeaf >= mLeaves.size()) {
-        throw CryptoError("NoiseFile: pool exhausted, no leaves left");
+NoiseProof NoiseFile::CreateProofAt(uint32_t index,
+                                    const bytes32& txHash) const {
+    if (index >= mLeaves.size()) {
+        throw CryptoError("NoiseFile: leaf index out of range");
     }
     if (mLevels.empty()) {
         throw CryptoError("NoiseFile: tree not built");
     }
 
-    const uint32_t index = mNextLeaf;
     NoiseProof p;
     p.leafIndex = index;
     p.leaf = mLeaves[index];
@@ -277,8 +285,72 @@ NoiseProof NoiseFile::CreateProof(const bytes32& txHash) {
         idx /= 2;
     }
 
+    return p;
+}
+
+NoiseProof NoiseFile::CreateProof(const bytes32& txHash) {
+    if (mNextLeaf >= mLeaves.size()) {
+        throw CryptoError("NoiseFile: pool exhausted, no leaves left");
+    }
+    NoiseProof p = CreateProofAt(mNextLeaf, txHash);
+    MarkLeafUsed(mNextLeaf);
     mNextLeaf++;
     return p;
+}
+
+bool NoiseFile::IsLeafUsed(uint32_t index) const {
+    const size_t byteIdx = index / 8;
+    if (byteIdx >= mUsed.size()) return false;
+    return (mUsed[byteIdx] & (1u << (index % 8))) != 0;
+}
+
+void NoiseFile::MarkLeafUsed(uint32_t index) {
+    if (index >= mLeaves.size()) return;
+    const size_t byteIdx = index / 8;
+    if (mUsed.size() < byteIdx + 1) {
+        mUsed.resize((mLeaves.size() + 7) / 8, 0);
+    }
+    mUsed[byteIdx] |= (uint8_t)(1u << (index % 8));
+}
+
+uint32_t NoiseFile::CountUsed() const {
+    uint32_t n = 0;
+    for (size_t i = 0; i < mUsed.size(); ++i) {
+        uint8_t b = mUsed[i];
+        while (b) { n += (b & 1u); b >>= 1; }
+    }
+    return n;
+}
+
+void NoiseFile::SetUsedMap(const std::vector<uint8_t>& map) {
+    mUsed = map;
+    mUsed.resize((mLeaves.size() + 7) / 8, 0);
+}
+
+std::vector<uint32_t> DeriveLeafIndices(const bytes32& txHash,
+                                        const bytes32& kps,
+                                        uint32_t count,
+                                        uint32_t leafCount) {
+    std::vector<uint32_t> out;
+    if (leafCount == 0 || count == 0) return out;
+    out.reserve(count);
+    for (uint32_t j = 0; j < count; ++j) {
+        std::vector<uint8_t> buf;
+        buf.reserve(68);
+        buf.insert(buf.end(), txHash.begin(), txHash.end());
+        buf.insert(buf.end(), kps.begin(), kps.end());
+        buf.push_back((uint8_t)(j & 0xFF));
+        buf.push_back((uint8_t)((j >> 8) & 0xFF));
+        buf.push_back((uint8_t)((j >> 16) & 0xFF));
+        buf.push_back((uint8_t)((j >> 24) & 0xFF));
+        bytes32 h = Sha256(buf.data(), buf.size());
+        uint32_t v = (uint32_t)h[0]
+                   | ((uint32_t)h[1] << 8)
+                   | ((uint32_t)h[2] << 16)
+                   | ((uint32_t)h[3] << 24);
+        out.push_back(v % leafCount);
+    }
+    return out;
 }
 
 bool NoiseFile::VerifyProof(const bytes32& root,

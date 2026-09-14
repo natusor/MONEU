@@ -37,6 +37,7 @@ private:
     std::vector<std::vector<bytes32> > mLevels;
     bytes32 mRoot;
     uint32_t mNextLeaf;
+    std::vector<uint8_t> mUsed;
 
     void BuildTree();
     void Wipe();
@@ -61,6 +62,13 @@ public:
     uint32_t GetRemaining() const { return (uint32_t)mLeaves.size() - mNextLeaf; }
 
     NoiseProof CreateProof(const bytes32& txHash);
+    NoiseProof CreateProofAt(uint32_t index, const bytes32& txHash) const;
+
+    bool IsLeafUsed(uint32_t index) const;
+    void MarkLeafUsed(uint32_t index);
+    uint32_t CountUsed() const;
+    const std::vector<uint8_t>& GetUsedMap() const { return mUsed; }
+    void SetUsedMap(const std::vector<uint8_t>& map);
 
     static bool VerifyProof(const bytes32& root,
                             const bytes32& txHash,
@@ -69,6 +77,11 @@ public:
 };
 
 bytes32 BindLeafToTx(const bytes32& leaf, const bytes32& txHash);
+
+std::vector<uint32_t> DeriveLeafIndices(const bytes32& txHash,
+                                        const bytes32& kps,
+                                        uint32_t count,
+                                        uint32_t leafCount);
 
 } // namespace MONEU
 

@@ -176,15 +176,17 @@ bool UTXOSet::ApplyTransactionForReplay(const Transaction& tx,
             if (proofBytes.empty()) continue;
             try {
                 size_t offset = 0;
-                NoiseProof proof = NoiseProof::Deserialize(
-                    proofBytes.data(), proofBytes.size(), offset);
-                NoiseLeafKey leafKey(input.GetKps(), proof.leafIndex);
-                if (!seenLeaves.insert(leafKey).second) {
-                    std::cerr << "UTXOSet: duplicate noise leaf in "
-                                 "transaction\n";
-                    return false;
+                while (offset < proofBytes.size()) {
+                    NoiseProof proof = NoiseProof::Deserialize(
+                        proofBytes.data(), proofBytes.size(), offset);
+                    NoiseLeafKey leafKey(input.GetKps(), proof.leafIndex);
+                    if (!seenLeaves.insert(leafKey).second) {
+                        std::cerr << "UTXOSet: duplicate noise leaf in "
+                                     "transaction\n";
+                        return false;
+                    }
+                    MarkNoiseLeafSpentLocked(leafKey.kps, leafKey.leafIndex);
                 }
-                MarkNoiseLeafSpentLocked(leafKey.kps, leafKey.leafIndex);
             } catch (const std::exception&) {
                 std::cerr << "UTXOSet: malformed noise proof\n";
                 return false;
@@ -369,19 +371,22 @@ bool UTXOSet::ApplyTransaction(const Transaction& tx,
             }
             try {
                 size_t offset = 0;
-                NoiseProof proof = NoiseProof::Deserialize(
-                    proofBytes.data(), proofBytes.size(), offset);
-                NoiseLeafKey leafKey(input.GetKps(), proof.leafIndex);
-                if (IsNoiseLeafSpentLocked(leafKey.kps, leafKey.leafIndex)) {
-                    std::cerr << "UTXOSet: noise leaf already consumed\n";
-                    return false;
+                while (offset < proofBytes.size()) {
+                    NoiseProof proof = NoiseProof::Deserialize(
+                        proofBytes.data(), proofBytes.size(), offset);
+                    NoiseLeafKey leafKey(input.GetKps(), proof.leafIndex);
+                    if (IsNoiseLeafSpentLocked(leafKey.kps,
+                                               leafKey.leafIndex)) {
+                        std::cerr << "UTXOSet: noise leaf already consumed\n";
+                        return false;
+                    }
+                    if (!seenLeaves.insert(leafKey).second) {
+                        std::cerr << "UTXOSet: duplicate noise leaf in "
+                                     "transaction\n";
+                        return false;
+                    }
+                    toMark.push_back(leafKey);
                 }
-                if (!seenLeaves.insert(leafKey).second) {
-                    std::cerr << "UTXOSet: duplicate noise leaf in "
-                                 "transaction\n";
-                    return false;
-                }
-                toMark.push_back(leafKey);
             } catch (const std::exception&) {
                 std::cerr << "UTXOSet: malformed noise proof\n";
                 return false;
@@ -474,10 +479,12 @@ bool UTXOSet::UndoTransaction(const Transaction& tx,
             if (!proofBytes.empty()) {
                 try {
                     size_t offset = 0;
-                    NoiseProof proof = NoiseProof::Deserialize(
-                        proofBytes.data(), proofBytes.size(), offset);
-                    UnmarkNoiseLeafSpentLocked(input.GetKps(),
-                                               proof.leafIndex);
+                    while (offset < proofBytes.size()) {
+                        NoiseProof proof = NoiseProof::Deserialize(
+                            proofBytes.data(), proofBytes.size(), offset);
+                        UnmarkNoiseLeafSpentLocked(input.GetKps(),
+                                                   proof.leafIndex);
+                    }
                 } catch (const std::exception&) {
                     std::cerr << "UTXOSet: malformed noise proof in undo\n";
                     return false;

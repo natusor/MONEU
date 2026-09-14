@@ -64,6 +64,9 @@ extern const int64_t   DUST_THRESHOLD;
 static const uint32_t NOISE_LEAF_COUNT_VALUE = 1048576;
 extern const uint32_t  NOISE_LEAF_COUNT;
 
+static const uint32_t NOISE_PROOFS_PER_INPUT_VALUE = 4;
+extern const uint32_t  NOISE_PROOFS_PER_INPUT;
+
 static const size_t NOISE_FILE_BYTES =
     (size_t)NOISE_LEAF_COUNT_VALUE * 32u;
 

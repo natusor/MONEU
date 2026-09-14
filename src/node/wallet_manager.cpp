@@ -806,16 +806,57 @@ bool WalletManager::SignTransaction(Transaction& tx) {
 
         const bytes32 txHash = tx.GetHash();
         std::vector<TxInput> inputs = tx.GetInputs();
+        std::vector<uint32_t> consumed;
         for (size_t i = 0; i < inputs.size(); ++i) {
-            NoiseProof proof = mNoiseFile->CreateProof(txHash);
-            inputs[i].SetNoiseProof(proof.Serialize());
+            const std::vector<uint32_t> wanted = DeriveLeafIndices(
+                txHash,
+                inputs[i].GetKps(),
+                NetParams::NOISE_PROOFS_PER_INPUT,
+                NetParams::NOISE_LEAF_COUNT);
+
+            for (size_t a = 0; a + 1 < wanted.size(); ++a) {
+                for (size_t b = a + 1; b < wanted.size(); ++b) {
+                    if (wanted[a] == wanted[b]) {
+                        throw WalletError(
+                            "This transaction calls for the same leaf twice. "
+                            "Change the amount or the fee by one unit and "
+                            "sign again.");
+                    }
+                }
+            }
+
+            std::vector<uint8_t> blob;
+            for (size_t j = 0; j < wanted.size(); ++j) {
+                if (IsNoiseLeafUsed(wanted[j])) {
+                    throw WalletError(
+                        "This transaction calls for a leaf already spent. "
+                        "Change the amount or the fee by one unit and "
+                        "sign again.");
+                }
+                for (size_t k = 0; k < consumed.size(); ++k) {
+                    if (consumed[k] == wanted[j]) {
+                        throw WalletError(
+                            "Two inputs call for the same leaf. Change the "
+                            "amount or the fee by one unit and sign again.");
+                    }
+                }
+                NoiseProof proof =
+                    mNoiseFile->CreateProofAt(wanted[j], txHash);
+                const std::vector<uint8_t> one = proof.Serialize();
+                blob.insert(blob.end(), one.begin(), one.end());
+                consumed.push_back(wanted[j]);
+            }
+            inputs[i].SetNoiseProof(blob);
         }
         tx.ClearInputs();
         for (size_t i = 0; i < inputs.size(); ++i) {
             tx.AddInput(inputs[i]);
         }
 
-        mNoiseNextLeaf = mNoiseFile->GetNextLeaf();
+        for (size_t i = 0; i < consumed.size(); ++i) {
+            MarkNoiseLeafUsed(consumed[i]);
+            mNoiseFile->MarkLeafUsed(consumed[i]);
+        }
 
         // The leaf pointer must reach the disk before this transaction is
         // allowed to leave the wallet.
@@ -875,6 +916,12 @@ uint32_t WalletManager::SyncNoiseLeafPointer(
 
     if (after > before) {
         mNoiseNextLeaf = after;
+        for (uint32_t i = 0; i < after; ++i) {
+            if (utxoSet.IsNoiseLeafSpent(mNoiseKps, i)) {
+                MarkNoiseLeafUsed(i);
+                mNoiseFile->MarkLeafUsed(i);
+            }
+        }
         if (!SaveToFile()) {
             std::cerr << "WalletManager: could not save the corrected "
                          "noise leaf pointer\n";
@@ -916,6 +963,7 @@ bool WalletManager::LoadNoiseFile(const std::string& passphrase) {
         mNoiseKps = nf.GetRoot();
         mNoiseFile.reset(new NoiseFile(std::move(nf)));
         mNoiseFile->SetNextLeaf(mNoiseNextLeaf);
+        mNoiseFile->SetUsedMap(mNoiseUsed);
         mNoiseLoaded = true;
     } catch (const std::exception&) {
         memzero(raw.data(), raw.size());
@@ -970,6 +1018,21 @@ bool WalletManager::Exists() const {
     return fs::exists(mWalletFile);
 }
 
+bool WalletManager::IsNoiseLeafUsed(uint32_t index) const {
+    const size_t byteIdx = index / 8;
+    if (byteIdx >= mNoiseUsed.size()) return false;
+    return (mNoiseUsed[byteIdx] & (1u << (index % 8))) != 0;
+}
+
+void WalletManager::MarkNoiseLeafUsed(uint32_t index) {
+    const size_t mapBytes = (NetParams::NOISE_LEAF_COUNT_VALUE + 7) / 8;
+    if (mNoiseUsed.size() < mapBytes) mNoiseUsed.resize(mapBytes, 0);
+    const size_t byteIdx = index / 8;
+    if (byteIdx < mNoiseUsed.size()) {
+        mNoiseUsed[byteIdx] |= (uint8_t)(1u << (index % 8));
+    }
+}
+
 bool WalletManager::SaveToFile() const {
     std::vector<uint8_t> buf;
 
@@ -1005,6 +1068,13 @@ bool WalletManager::SaveToFile() const {
     put(&mNextKeyIndex, sizeof(mNextKeyIndex));
     put(&mNextChangeIndex, sizeof(mNextChangeIndex));
     put32(mNoiseNextLeaf);
+
+    size_t usedLen = mNoiseUsed.size();
+    while (usedLen > 0 && mNoiseUsed[usedLen - 1] == 0) --usedLen;
+    put32(static_cast<uint32_t>(usedLen));
+    if (usedLen > 0) {
+        put(mNoiseUsed.data(), usedLen);
+    }
 
     put32(0);
 
@@ -1088,7 +1158,7 @@ bool WalletManager::LoadFromFile() {
     uint32_t version = 0;
     file.read(reinterpret_cast<char*>(&version),
               sizeof(version));
-    if (version != WALLET_VERSION) {
+    if (version != WALLET_VERSION && version != WALLET_VERSION_OLD) {
         throw WalletError(
             "Unsupported wallet version: " +
             std::to_string(version));
@@ -1171,6 +1241,24 @@ bool WalletManager::LoadFromFile() {
     if (mNoiseNextLeaf > NetParams::NOISE_LEAF_COUNT) {
         throw WalletError(
             "Invalid wallet file - noise leaf pointer out of range");
+    }
+
+    const size_t mapBytes = (NetParams::NOISE_LEAF_COUNT_VALUE + 7) / 8;
+    mNoiseUsed.assign(mapBytes, 0);
+    if (version >= WALLET_VERSION) {
+        uint32_t usedLen = 0;
+        file.read(reinterpret_cast<char*>(&usedLen), sizeof(usedLen));
+        if (usedLen > mapBytes) {
+            throw WalletError(
+                "Invalid wallet file - leaf map larger than the pool");
+        }
+        if (usedLen > 0) {
+            file.read(reinterpret_cast<char*>(mNoiseUsed.data()), usedLen);
+        }
+    } else {
+        for (uint32_t i = 0; i < mNoiseNextLeaf; ++i) {
+            mNoiseUsed[i / 8] |= (uint8_t)(1u << (i % 8));
+        }
     }
 
     uint32_t preparedCount = 0;
