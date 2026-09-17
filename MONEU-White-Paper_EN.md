@@ -31,14 +31,16 @@ Version 2, 17 September 2026
 
 ## 1. Introduction
 
-MONEU is an electronic system for transferring and holding value that runs without an intermediary. 
-It rests on SHA-256 proof of work. What sets it apart is that a private key on its own no longer moves coins. 
-Beyond that layer MONEU uses methods already proven in older proof of work systems. 
-These are the UTXO model and Merkle trees and the choice of the chain with the greatest work.
-
-In such systems the right to spend is decided by the private key signature alone. 
-That is enough for as long as nobody can recover the private key from the public one. 
-MONEU requires a one time proof from a private file of physical randomness as a second factor that no amount of computing power can derive. It is a file and not a puzzle so there is nothing in it to solve.
+MONEU is an electronic system for transferring and holding value that runs without an intermediary.
+Every wallet holds a private file of physical randomness. 
+That file is cut into pieces called leaves and a transfer is authorised by leaves from it. 
+No amount of computing power derives that file because there is nothing in it to solve.
+The rest is the block structure the industry has used for years. 
+SHA-256 proof of work. 
+The UTXO model. Merkle trees. The chain with the greatest work.
+In those systems the private key signature alone decides the right to spend. 
+That holds for as long as nobody can recover the private key from the public one. 
+In MONEU a recovered private key moves nothing.
 
 ---
 
@@ -52,11 +54,12 @@ The root of that tree is public and is called the KPS.
 The noise file itself is never revealed.
 One leaf is 32 bytes. 
 A file holds 1048576 leaves and takes 32 megabytes.
-
 Spending one output reveals four leaves together with their paths through the tree. 
 The transaction decides which four. 
-Each index comes from the hash of the transaction, the KPS and the position of the input. 
-A different transaction therefore calls for a different set of leaves. 
+Each index comes from three things. 
+The hash of the transaction. 
+The KPS. 
+The position of the input. 
 Anyone can then check whether those leaves really belong to this KPS. 
 They are marked as spent and cannot be used again while every other leaf in the file stays secret.
 
@@ -65,7 +68,6 @@ They are marked as spent and cannot be used again while every other leaf in the 
 ## 3. The physical source of entropy
 
 It matters where the material for the noise file comes from.
-
 The material for this file comes from sources that carry an unpredictable physical component. 
 The flow of electrons in hardware is one of them. 
 Part of that unpredictability comes from thermal noise and from shot noise. 
@@ -84,7 +86,6 @@ The generator measures how much the readings vary before it writes anything.
 It refuses to build a file when the variation is too small to trust. 
 That refusal is deliberate. 
 A file that looks random without being random would give a false sense of safety.
-
 For that reason a noise file cannot be made on a virtual machine. 
 A hypervisor smooths the processor cycle counter and the variation the generator needs disappears. 
 The generator then stops and reports that the readings barely differ. 
@@ -93,7 +94,6 @@ It is the guard doing its work.
 A wallet and its noise file belong on a physical computer. 
 A virtual machine can still run a full node and mine to an address created elsewhere. 
 Mining needs no wallet and no noise file on the computer that mines.
-
 The material gathered this way passes through a hash function. 
 The hash does not create randomness but only spreads out what has already been gathered. 
 The choice of sources belongs to the wallet and is not part of the network rules. 
@@ -121,37 +121,31 @@ That would unfortunately require listening to the surroundings or recording keys
 ## 5. Transaction step by step
 
 Alice wants to send coins to Bob.
-
-Her wallet works out which four leaves this transaction calls for and builds a proof from each of them. 
+Her wallet computes which four leaves this transaction requires and builds a proof from each of them. 
 It then signs the whole transaction with Alice's private key under Ed25519 and sends it to the network.
-
 Every time each node checks five things. 
 Whether the Ed25519 signature is valid. 
 Whether Alice's public key matches her address. 
 Whether the revealed leaves belong to Alice's KPS along the Merkle path. 
-Whether the proofs carry the four leaves this transaction calls for. 
+Whether the proofs carry the four leaves this transaction requires. 
 Whether none of those leaves has been used before.
 
 Only when all five are confirmed as correct does the transfer enter a block and Alice's four leaves are marked as spent. 
 Bob then receives the coins on a transaction output and can spend them later with leaves from his own noise file.
-
-
 The transaction hash is computed without the proofs. 
 That is what lets every proof bind to that hash without a circular dependency.
-
 The single use of a leaf is checked at several levels and because of that the same leaf cannot pass twice. 
 The first check is inside one transaction and the second inside one block. 
 The third is in the queue of transactions waiting for a block. 
 The fourth is in the set of spent leaves of the whole chain. 
 The last one comes when the new state is written to disk.
-
 The set of spent leaves is tied to the active chain. 
 If an ordinary reorganisation detaches a block then the leaves it spent return to the pool. 
 Its transactions return to the queue. 
 They confirm again on the chain that won. 
 In this way the set of spent leaves always matches the active chain.
 Leaves come back only so that the same transaction can settle. 
-Any other transaction has a different hash and therefore calls for a different set of leaves. 
+Any other transaction has a different hash and therefore requires a different set of leaves. 
 Those leaves come from the noise file alone. 
 Whoever does not hold that file holds nothing that would authorise a different transfer.
 Between two competing transfers the chain decides by order. 
@@ -172,14 +166,12 @@ That address is therefore also a demonstration of how the shield works.
 
 Which chain is the right one is decided by the greatest total work. 
 Never by height alone.
-
 Anyone who runs a node synchronises the whole chain from the block of creation and reaches the same state as every other node in the network.
 The history is protected by the rule of greatest total work. 
 Rewriting an old part of the chain would mean redoing all the work that was built on top of it. 
 Checkpoints written into the code give a second layer. 
 A checkpoint names a block at a chosen height and every node refuses a chain that disagrees with it. 
 Checkpoints are added as the chain grows longer.
-
 The mining difficulty adjusts once every 2016 blocks. 
 At the target pace that is roughly once every two weeks. 
 The network measures the real time of the recent blocks and corrects the difficulty to return to a pace of one block every ten minutes.
@@ -195,24 +187,21 @@ That is why the greatest contribution to the growth of the network is running yo
 
 The MONEU supply is fixed at 30000000 coins. 
 One coin divides into 100000000 smallest units.
-
 The block reward starts at 77 coins. 
 A halving occurs every 194804 blocks which is roughly every 3.7 years. 
 The reward then falls by half and so on until it reaches zero. 
 This should take about 33 epochs which is around 122 years. 
 The total emission of the whole schedule is 29999815.97 coins. 
 That leaves 184.03 coins of headroom.
-
 The first epoch produces 14999908 coins which is just under half of the whole supply. 
 The interval of 194804 blocks was chosen so that the sum of the whole schedule fits under the value of 30000000.
 Those who join earliest and support the network by keeping nodes running and mining coins are the pioneers. 
 With a small effort of their own processors they will earn coins most easily.
 
-MONEU deliberately has no tail emission. 
+MONEU has no tail emission. 
 When successive halvings bring it to zero the reward in coins for mining a block ends for good.
 From that point miners live on the fees of the transfers a block carries.
 Mining stays worthwhile because of the scale of the network and the number of transactions whose fees pay for every further block.
-
 The whole fee goes to the miner who put the transaction into a block. 
 This keeps miners paid after the last coin is mined. 
 Such a fee depends on the size of the transaction in bytes. 
@@ -244,8 +233,8 @@ The prefix byte says what kind of address it is.
 It also decides the character an address starts with. 
 A payment address uses 33 and starts with the digit 2 and is 51 characters long. 
 Two further prefix bytes are reserved for kinds of address that MONEU does not build today.
-
-The KPS is part of the address hash and nobody will create a valid address without both the key and the noise file. Your address is bound to one particular noise file.
+The KPS is part of the address hash and nobody will create a valid address without both the key and the noise file. 
+Your address is bound to one particular noise file.
 
 Transactions use the UTXO model. 
 Every input points to the output being spent. 
@@ -271,7 +260,6 @@ Somebody looking from outside sees only a number and does not know what it refer
 
 MONEU is a network of equal nodes with no central server. 
 Every full node keeps the whole history and also checks every block and every transaction itself without relying on anyone.
-
 The network layer keeps connections and passes on blocks and transactions within sizes that protect against overload. 
 The transaction queue checks and holds transfers waiting for confirmation and also protects against double spending and against reuse of a leaf. 
 A transfer waiting for a block is not lost when the node is stopped. 
@@ -319,7 +307,8 @@ Then create a wallet.
 ./build/src/moneu-cli createwallet "your-passphrase"
 ```
 
-Then create the noise file. Without it you cannot spend the coins from your wallet even holding the private key. 
+Then create the noise file. 
+Without it you cannot spend the coins from your wallet even holding the private key. 
 
 **Creating the noise file**
 
@@ -328,7 +317,8 @@ Then create the noise file. Without it you cannot spend the coins from your wall
 ```
 
 Creating the noise file takes a few minutes and loads the computer on purpose. 
-Do not interrupt it. This is the only noise file your wallet will ever have. 
+Do not interrupt it. 
+This is the only noise file your wallet will ever have. 
 After it is made you will find it in the wallet directory.
 `~/.moneu/wallet/noise.dat` 
 That file is 32 megabytes holding 1048576 single use leaves.
@@ -344,7 +334,6 @@ Its noise file is created with it and belongs to it alone.
 No other noise file can be attached later and no noise file can be handed to a second wallet. 
 Every address is derived from the key together with the KPS. 
 Both halves must be the same ones that created it.
-
 The backup is therefore a pair. 
 The wallet file and the noise file. 
 Copied they should be kept together and used together.
@@ -392,7 +381,6 @@ Loading the noise file takes about half a minute.
 The wallet must be unlocked before any transfer. 
 Given no fee the wallet works out what the transfer weighs and sets the fee from that weight. 
 This is the form to use in normal work.
-
 A fee given by hand replaces that calculation. 
 It must cover the weight of the transfer or the wallet refuses and names the amount required. 
 A transfer carrying a message weighs more than a plain one so it needs more than the floor. 
@@ -404,7 +392,8 @@ The message may hold at most 300 bytes.
 ```
 
 After every transfer a counter is shown telling how many unused leaves are left in the noise file. 
-Keep an eye on that number. If few leaves are left then on a separate computer create a new wallet with its own noise file and a new address. 
+Keep an eye on that number. 
+If few leaves are left then on a separate computer create a new wallet with its own noise file and a new address. 
 Move the coins to it from the old address before the available leaves run out.
 When the leaves run out then no transfer can be authorised from such a wallet any more.
 
@@ -436,9 +425,7 @@ Waiting transfers go to `~/.moneu/mempool.dat` and come back at the next start.
 ## 12. Spent files as an archive
 
 This chapter is about what can be done with a noise file once every leaf in it has been spent.
-
 A noise file is a collection of 1048576 pieces of randomness gathered from real events in hardware.
-
 When the owner has spent every leaf then the file loses its value for the wallet. 
 Such a file does not however lose its value as physical material. 
 A spent file gives no power over any address so sharing it puts no coins at risk.
@@ -454,36 +441,27 @@ That is why the decision whether to share a spent file belongs to the owner of t
 Together the parts described above mean that recovering a private key is not enough to take the coins. 
 They do not however protect against losing your own noise file or your own key. 
 The safety of those files is up to the wallet owner and nobody else.
-
 Spending coins requires three things. 
 The private key. 
 The noise file the address is bound to. 
-The four unused leaves that transaction calls for. 
-
+The four unused leaves that transaction required
 A private key on its own moves nothing. 
-Every transfer needs unused leaves and unused leaves live in the noise file alone. 
-An opponent who recovers a private key and does not hold that file can read a balance and can do nothing with it.
-
+An opponent who recovers a private key and does not hold the noise file can read a balance and nothing more.
 A public key becomes visible only when an address spends. 
 The change of that transfer moves to a fresh address whose key has never been seen. 
 Each address is therefore used once and the key of the next transfer is not on the chain yet when the previous one settles. 
 The wallet creates that fresh address by itself for every change output.
-
 This is why an address should not be used twice. 
 A transfer takes only the outputs it needs to cover the amount and the fee. 
 An address that received many payments keeps the rest of them after a transfer and its public key is by then on the chain. 
 Mining to one address again and again builds exactly that situation.
-
 A leaf that has been used is worthless to anyone. 
-It is written as spent across the whole chain and no node accepts it a second time. 
-The four leaves a transaction reveals are the four that transaction calls for. 
-Any other transaction calls for a different four.
-
+It is written as spent across the whole chain and no node accepts it a second time.
 One noise file serves the whole wallet. 
 Addresses for payment and addresses for change are bound to the same KPS and draw from the same leaves. 
 The counter of unused leaves therefore belongs to the wallet and not to any single address. 
 A wallet is made once and lives as long as unused leaves remain in that file. 
-Each input takes four leaves, so one file covers 262144 spends. 
+That is 262144 spends. 
 Copy the wallet file and the noise file together and keep both for as long as the wallet holds anything.
 
 What chapter seven says about a very strong opponent holds here too.
@@ -492,41 +470,44 @@ What chapter seven says about a very strong opponent holds here too.
 
 ## 14. Parameter summary
 
-The network is called MONEU. The proof of work is SHA-256. The signature curve is Ed25519. The shield is single use leaves from a file of physical randomness.
-
-The address hash is formed as SHA-256 of the public key together with the KPS. A payment address is that hash written in Base58Check behind the prefix byte 33. It starts with the digit 2 and is 51 characters long.
-
-The maximum supply is 30000000 coins. One coin divides into 100000000 units. The block time is 600 seconds. The initial reward is 77 coins per block. A halving occurs every 194804 blocks which is about every 3.7 years. The schedule runs for 33 epochs and about 122 years. Then emission ends and miners earn from transaction fees alone. Total emission is 29999815.97 coins.
-
-The difficulty adjusts every 2016 blocks which is about every 14 days. A single correction may move the difficulty only so far in either direction. A block timestamp may not run ahead of the clock by more than two hours.
-
-The noise file holds 1048576 leaves of 32 bytes each and takes 32 megabytes. The maximum block size is 6 megabytes. A mining reward matures after 50 blocks. The extra data field holds at most 300 bytes. The fee is 1 unit per byte and never less than 1000 units in total. The dust threshold is 1000 units. The peer to peer port is 8327. The port of the interface for programs is 8328.
+The network is called MONEU. 
+The proof of work is SHA-256. 
+The signature curve is Ed25519. 
+The shield is single use leaves from a file of physical randomness.
+The address hash is formed as SHA-256 of the public key together with the KPS. 
+A payment address is that hash written in Base58Check behind the prefix byte 33. It starts with the digit 2 and is 51 characters long.
+The maximum supply is 30000000 coins. One coin divides into 100000000 units. The block time is 600 seconds. The initial reward is 77 coins per block. 
+A halving occurs every 194804 blocks which is about every 3.7 years. 
+The schedule runs for 33 epochs and about 122 years. Then emission ends and miners earn from transaction fees alone. Total emission is 29999815.97 coins.
+The difficulty adjusts every 2016 blocks which is about every 14 days. 
+A single correction may move the difficulty only so far in either direction. 
+A block timestamp may not run ahead of the clock by more than two hours.
+The noise file holds 1048576 leaves of 32 bytes each and takes 32 megabytes. 
+The maximum block size is 6 megabytes. A mining reward matures after 50 blocks. 
+The extra data field holds at most 300 bytes. The fee is 1 unit per byte and never less than 1000 units in total. The dust threshold is 1000 units. The peer to peer port is 8327. The port of the interface for programs is 8328.
 
 ---
 
 ## 15. Disclaimer
 
 This document describes the technical design of MONEU.
-
-MONEU is open source software released for further development. The code is there to be read and checked by anyone who wants to. Taking part in the network is voluntary.
-
-The noise file and the private keys are held by the owner. Losing them means losing access to the coins for good. Keep copies on separate encrypted media.
-
-The safety of the operating system and the computer is up to the user. MONEU is not responsible for an unsecured device or system.
+MONEU is open source software released for further development. The code is there to be read and checked by anyone who wants to. 
+Taking part in the network is voluntary.
+The noise file and the private keys are held by the owner. Losing them means losing access to the coins for good. 
+Keep copies on separate encrypted media.
+The safety of the operating system and the computer is up to the user. 
+MONEU is not responsible for an unsecured device or system.
 
 ---
 
 ## 16. Acknowledgements
 
 I thank Adam Back for Hashcash and for the idea of proof of work based on a hash function. I also thank Satoshi Nakamoto for building a consensus without an intermediary on that foundation.
-
 Special thanks go to everyone who runs a full node and keeps it running as long as possible. Also to everyone who keeps a node on a VPS.
-
 MONEU deliberately does not use the post quantum signature schemes recommended by NIST and the NSA.
-
-Those schemes keep the leaf secret and sign with it. MONEU shows the leaf instead. If the same leaf turns up twice the network simply refuses the second one, and that is the end of it.
-
+Those schemes keep the leaf secret and sign with it. MONEU shows the leaf instead. If the same leaf appears twice the network refuses the second one.
 Not your noise file, not your coins.
 
 natusor
+
 natusor@tutamail.com
