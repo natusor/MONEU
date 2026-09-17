@@ -170,7 +170,7 @@ private:
     // the entropy, so the stored field is bounded by entropy + one block.
     static const uint32_t MAX_ENCRYPTED_ENTROPY_SIZE =
         MAX_ENTROPY_SIZE + static_cast<uint32_t>(crypto::ENC_BLOCK_SIZE);
-    static const uint32_t MAX_ADDRESSES     = 100000;
+    static const uint32_t MAX_ADDRESSES     = 1000000;
 
     // Encrypts `entropy` under `passphrase`, filling mSalt with a fresh random
     // salt, mEncryptedEntropy with the ciphertext and mTag with its

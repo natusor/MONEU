@@ -531,6 +531,45 @@ int64_t UTXOSet::GetBalance(const bytes32& pubkeyHash) const {
     return balance;
 }
 
+std::vector<std::pair<OutPoint, Coin>> UTXOSet::GetUTXOsForAddresses(
+    const std::set<bytes32>& pubkeyHashes) const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+
+    std::vector<std::pair<OutPoint, Coin>> result;
+    if (pubkeyHashes.empty()) return result;
+
+    for (const auto& entry : mCache) {
+        if (!entry.second.coin.isSpent &&
+            pubkeyHashes.find(entry.second.coin.pubkeyHash)
+                != pubkeyHashes.end()) {
+            result.push_back({entry.first, entry.second.coin});
+        }
+    }
+
+    std::unique_ptr<DBIterator> it(mDB->NewIterator());
+    it->SeekToFirst();
+    while (it->Valid()) {
+        OutPoint outpoint;
+        if (!it->GetKey(outpoint)) { it->Next(); continue; }
+
+        Coin coin;
+        if (!it->GetValue(coin)) {
+            it->Next();
+            continue;
+        }
+
+        if (!coin.isSpent &&
+            pubkeyHashes.find(coin.pubkeyHash) != pubkeyHashes.end() &&
+            mCache.find(outpoint) == mCache.end()) {
+            result.push_back({outpoint, coin});
+        }
+        it->Next();
+    }
+
+    return result;
+}
+
 std::vector<std::pair<OutPoint, Coin>> UTXOSet::GetUTXOsForAddress(
     const bytes32& pubkeyHash) const
 {

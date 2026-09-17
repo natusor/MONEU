@@ -329,6 +329,7 @@ void NoiseFile::SetUsedMap(const std::vector<uint8_t>& map) {
 
 std::vector<uint32_t> DeriveLeafIndices(const bytes32& txHash,
                                         const bytes32& kps,
+                                        uint32_t inputIndex,
                                         uint32_t count,
                                         uint32_t leafCount) {
     std::vector<uint32_t> out;
@@ -336,9 +337,13 @@ std::vector<uint32_t> DeriveLeafIndices(const bytes32& txHash,
     out.reserve(count);
     for (uint32_t j = 0; j < count; ++j) {
         std::vector<uint8_t> buf;
-        buf.reserve(68);
+        buf.reserve(72);
         buf.insert(buf.end(), txHash.begin(), txHash.end());
         buf.insert(buf.end(), kps.begin(), kps.end());
+        buf.push_back((uint8_t)(inputIndex & 0xFF));
+        buf.push_back((uint8_t)((inputIndex >> 8) & 0xFF));
+        buf.push_back((uint8_t)((inputIndex >> 16) & 0xFF));
+        buf.push_back((uint8_t)((inputIndex >> 24) & 0xFF));
         buf.push_back((uint8_t)(j & 0xFF));
         buf.push_back((uint8_t)((j >> 8) & 0xFF));
         buf.push_back((uint8_t)((j >> 16) & 0xFF));

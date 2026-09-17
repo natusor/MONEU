@@ -350,6 +350,7 @@ bool TxValidation::VerifyTransactionSignatures(
             const std::vector<uint32_t> wanted = DeriveLeafIndices(
                 tx.GetHash(),
                 input.GetKps(),
+                static_cast<uint32_t>(i),
                 NetParams::NOISE_PROOFS_PER_INPUT,
                 NetParams::NOISE_LEAF_COUNT);
 

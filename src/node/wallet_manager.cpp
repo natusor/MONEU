@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <cstring>
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cerrno>
 
@@ -446,6 +447,11 @@ WalletAddress WalletManager::GetNewAddress(
 }
 
 WalletAddress WalletManager::GetChangeAddress() {
+    if (mAddresses.size() >= MAX_ADDRESSES) {
+        throw WalletError(
+            "Maximum number of addresses reached");
+    }
+
     if (mLocked || mUnlockedSeed.size() != 64) {
         throw WalletError(
             "Wallet must be unlocked to create a change address");
@@ -498,9 +504,16 @@ int64_t WalletManager::GetTotalBalance(
     const storage::UTXOSet& utxoSet) const
 {
     std::lock_guard<std::mutex> lock(mMutex);
-    int64_t total = 0;
+
+    std::set<bytes32> mine;
     for (const auto& addr : mAddresses) {
-        total += utxoSet.GetBalance(addr.pubkeyHash);
+        mine.insert(addr.pubkeyHash);
+    }
+
+    int64_t total = 0;
+    auto utxos = utxoSet.GetUTXOsForAddresses(mine);
+    for (const auto& u : utxos) {
+        total += u.second.value;
     }
     return total;
 }
@@ -527,13 +540,15 @@ WalletManager::GetSpendableUTXOs(
     std::vector<std::pair<storage::OutPoint,
                           storage::Coin>> result;
 
+    std::set<bytes32> mine;
     for (const auto& addr : mAddresses) {
-        auto utxos =
-            utxoSet.GetUTXOsForAddress(addr.pubkeyHash);
-        for (auto& utxo : utxos) {
-            if (!IsSpendableNow(utxo.second, chainHeight)) continue;
-            result.push_back(utxo);
-        }
+        mine.insert(addr.pubkeyHash);
+    }
+
+    auto utxos = utxoSet.GetUTXOsForAddresses(mine);
+    for (auto& utxo : utxos) {
+        if (!IsSpendableNow(utxo.second, chainHeight)) continue;
+        result.push_back(utxo);
     }
 
     return result;
@@ -623,19 +638,22 @@ Transaction WalletManager::CreateTransaction(
     std::vector<std::pair<storage::OutPoint, storage::Coin>> spendable;
     int64_t immatureHeld = 0;
 
+    std::set<bytes32> mine;
     for (const auto& a : mAddresses) {
-        auto utxos = utxoSet.GetUTXOsForAddress(a.pubkeyHash);
-        for (auto& u : utxos) {
-            if (!IsSpendableNow(u.second, chainHeight)) {
-                immatureHeld += u.second.value;
-                continue;
-            }
-            if (mHeldOutpoints.count(
-                    OutpointKey(u.first.txHash, u.first.index)) > 0) {
-                continue;
-            }
-            spendable.push_back(u);
+        mine.insert(a.pubkeyHash);
+    }
+
+    auto utxos = utxoSet.GetUTXOsForAddresses(mine);
+    for (auto& u : utxos) {
+        if (!IsSpendableNow(u.second, chainHeight)) {
+            immatureHeld += u.second.value;
+            continue;
         }
+        if (mHeldOutpoints.count(
+                OutpointKey(u.first.txHash, u.first.index)) > 0) {
+            continue;
+        }
+        spendable.push_back(u);
     }
 
     if (poolTxs != NULL) {
@@ -756,6 +774,8 @@ Transaction WalletManager::CreateTransaction(
 bool WalletManager::SignTransaction(Transaction& tx) {
     std::lock_guard<std::mutex> lock(mMutex);
 
+    const bytes32 unsignedId = tx.GetHash();
+
     if (mLocked || mUnlockedSeed.size() != 64) {
         throw WalletError("Wallet is locked");
     }
@@ -795,6 +815,17 @@ bool WalletManager::SignTransaction(Transaction& tx) {
         return false;
     }
 
+    const bytes32 signedId = tx.GetHash();
+    if (!(signedId == unsignedId)) {
+        for (std::map<std::string, bytes32>::iterator it =
+                 mHeldOutpoints.begin();
+             it != mHeldOutpoints.end(); ++it) {
+            if (it->second == unsignedId) {
+                it->second = signedId;
+            }
+        }
+    }
+
     if (!tx.IsCoinbase()) {
         const size_t inputCount = tx.GetInputCount();
         if (mNoiseFile->GetRemaining() < inputCount) {
@@ -811,6 +842,7 @@ bool WalletManager::SignTransaction(Transaction& tx) {
             const std::vector<uint32_t> wanted = DeriveLeafIndices(
                 txHash,
                 inputs[i].GetKps(),
+                static_cast<uint32_t>(i),
                 NetParams::NOISE_PROOFS_PER_INPUT,
                 NetParams::NOISE_LEAF_COUNT);
 
@@ -857,6 +889,7 @@ bool WalletManager::SignTransaction(Transaction& tx) {
             MarkNoiseLeafUsed(consumed[i]);
             mNoiseFile->MarkLeafUsed(consumed[i]);
         }
+
 
         // The leaf pointer must reach the disk before this transaction is
         // allowed to leave the wallet.

@@ -120,7 +120,7 @@ size_t NoiseProofBytesPerInput() {
     uint32_t leaves = NetParams::NOISE_LEAF_COUNT_VALUE;
     while (leaves > 1) { leaves >>= 1; ++depth; }
     const size_t proof = 4 + 32 + 32 + 4 + depth * 32 + depth;
-    return 4 + proof;
+    return 4 + proof * NetParams::NOISE_PROOFS_PER_INPUT;
 }
 
 // What the transaction will weigh once it is signed.

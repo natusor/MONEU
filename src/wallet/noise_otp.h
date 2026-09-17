@@ -59,7 +59,11 @@ public:
     uint32_t GetNextLeaf() const { return mNextLeaf; }
 
     void SetNextLeaf(uint32_t next);
-    uint32_t GetRemaining() const { return (uint32_t)mLeaves.size() - mNextLeaf; }
+    uint32_t GetRemaining() const {
+        const uint32_t total = (uint32_t)mLeaves.size();
+        const uint32_t used = CountUsed();
+        return (used >= total) ? 0 : (total - used);
+    }
 
     NoiseProof CreateProof(const bytes32& txHash);
     NoiseProof CreateProofAt(uint32_t index, const bytes32& txHash) const;
@@ -80,6 +84,7 @@ bytes32 BindLeafToTx(const bytes32& leaf, const bytes32& txHash);
 
 std::vector<uint32_t> DeriveLeafIndices(const bytes32& txHash,
                                         const bytes32& kps,
+                                        uint32_t inputIndex,
                                         uint32_t count,
                                         uint32_t leafCount);
 

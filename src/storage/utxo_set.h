@@ -181,6 +181,9 @@ public:
 
     int64_t GetBalance(const bytes32& pubkeyHash) const;
 
+    std::vector<std::pair<OutPoint, Coin>> GetUTXOsForAddresses(
+        const std::set<bytes32>& pubkeyHashes) const;
+
     std::vector<std::pair<OutPoint, Coin>> GetUTXOsForAddress(
         const bytes32& pubkeyHash) const;
 
