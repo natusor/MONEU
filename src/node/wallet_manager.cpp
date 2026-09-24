@@ -607,6 +607,14 @@ Transaction WalletManager::CreateTransaction(
         throw WalletError("Invalid amount");
     }
 
+
+    if (amount < NetParams::DUST_THRESHOLD) {
+        throw WalletError(
+            "Amount is below the dust threshold. The smallest amount "
+            "you can send is 0.00001000.");
+    }
+
+
     if (fee < NetParams::MIN_TX_FEE) {
         throw WalletError("Fee too low");
     }

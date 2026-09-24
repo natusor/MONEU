@@ -11,6 +11,7 @@
 #include "storage/chain_state.h"
 #include "consensus/mempool.h"
 #include "net/net.h"
+#include "node/gpu_miner.h"
 
 #include <atomic>
 #include <thread>
@@ -35,13 +36,16 @@ public:
     Miner(const Miner&) = delete;
     Miner& operator=(const Miner&) = delete;
 
-    bool Start(const bytes32& coinbaseOutputHash, int threads);
+    bool Start(const bytes32& coinbaseOutputHash, int threads,
+               bool useGpu = false);
 
     void Stop();
 
     void SetChainSyncCallback(std::function<void()> cb);
 
     bool IsMining() const { return mMining.load(); }
+
+    bool UsingGpu() const { return mUseGpu.load(); }
 
     void GetStats(uint64_t& hashes, uint64_t& blocks, double& hashRate) const;
 
@@ -57,6 +61,8 @@ private:
     storage::ChainState* mChainState;
     Mempool*             mMempool;
     net::ConnManager*    mConnManager;
+    MONEU::GpuMiner   mGpu;
+    std::atomic<bool> mUseGpu;
     std::function<void()> mChainSync;
 
     std::atomic<bool> mMining;
@@ -84,7 +90,14 @@ private:
 
     bool ComputeTxFee(const Transaction& tx, uint64_t& feeOut) const;
 
+    void BuildMiningBlocks(const BlockHeader& hdr,
+                           uint32_t midstate[8],
+                           uint32_t block2[16],
+                           uint32_t block3[16]) const;
+
     bool RunNonceLoop(Block& block, int workerId);
+
+    bool RunNonceLoopGpu(Block& block, int workerId);
 
     void ReportRate(int workerId, double rate);
 

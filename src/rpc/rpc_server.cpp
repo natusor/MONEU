@@ -1471,7 +1471,7 @@ void RPCServer::RegisterBuiltinCommands() {
         [](const RPCRequest&,
            const RPCContext& ctx) -> json {
             json result;
-            result["version"]   = "0.1.0";
+            result["version"]   = "0.2.0";
             result["network"]   = NetParams::NETWORK_ID;
             result["useragent"] = NetParams::USER_AGENT;
             // From the running configuration, not the compiled default. A
@@ -2553,6 +2553,12 @@ void RegisterWalletRPCCommands(RPCTable& table) {
                 if (fee < 0)
                     throw RPCError(RPC_INVALID_PARAMS,
                         "Fee must not be negative");
+                if (fee > NetParams::COIN)
+                    throw RPCError(RPC_INVALID_PARAMS,
+                        "Fee of " + FormatAmount(fee) + " looks like a "
+                        "mistake. A whole number is read as coins, not "
+                        "units. For a fee of 3500 units write 0.00003500");
+
                 feeExplicit = true;
             }
             if (amount <= 0)
@@ -3056,15 +3062,15 @@ void RegisterMiningRPCCommands(RPCTable& table) {
         }
     ));
 
-    // startmining "address" [threads] - begin background proof-of-work
+    // startmining "address" [threads] [gpu] - begin background proof-of-work
     // mining, paying rewards to an explicitly supplied address. The address
     // is mandatory: the node never mines to a configured or implicit
     // address, so starting the miner is always a deliberate operator action
     // with a visible destination.
     table.Register(RPCCommand(
         "mining", "startmining",
-        "startmining \"address\" [threads] - Start background proof-of-work "
-        "mining, paying rewards to the given address",
+        "startmining \"address\" [threads] [gpu] - Start background "
+        "proof-of-work mining, paying rewards to the given address",
         [](const RPCRequest& req,
            const RPCContext& ctx) -> json {
             if (!ctx.miner) {
@@ -3075,7 +3081,7 @@ void RegisterMiningRPCCommands(RPCTable& table) {
                 req.params.empty() ||
                 !req.params[0].is_string()) {
                 throw RPCError(RPC_INVALID_PARAMS,
-                    "address required: startmining \"address\" [threads]");
+                    "address required: startmining \"address\" [threads] [gpu]");
             }
             std::string addrStr = req.params[0].get<std::string>();
             // Decode and fully validate the reward address: prefix byte,
@@ -3109,19 +3115,39 @@ void RegisterMiningRPCCommands(RPCTable& table) {
             std::memcpy(outputHash.data(), decoded + 1, 32);
 
             int threads = 1;
-            if (req.params.is_array() && req.params.size() >= 2 &&
-                req.params[1].is_number_integer()) {
-                threads = req.params[1].get<int>();
+            bool useGpu = false;
+            bool deviceSet = false;
+            bool threadsSet = false;
+            for (size_t i = 1; i < req.params.size(); ++i) {
+                const json& p = req.params[i];
+                if (p.is_number_integer() && !threadsSet && !deviceSet) {
+                    threads = p.get<int>();
+                    threadsSet = true;
+                } else if (p.is_string() && !deviceSet) {
+                    const std::string dev = p.get<std::string>();
+                    if (dev == "gpu" || dev == "GPU") {
+                        useGpu = true;
+                    } else if (dev != "cpu" && dev != "CPU") {
+                        throw RPCError(RPC_INVALID_PARAMS,
+                            "usage: startmining \"address\" [threads] [gpu|cpu]");
+                    }
+                    deviceSet = true;
+                } else {
+                    throw RPCError(RPC_INVALID_PARAMS,
+                        "usage: startmining \"address\" [threads] [gpu|cpu]");
+                }
             }
             if (threads < 1) threads = 1;
 
-            if (!ctx.miner->Start(outputHash, threads)) {
+            if (!ctx.miner->Start(outputHash, threads, useGpu)) {
                 throw RPCError(RPC_MISC_ERROR,
                     "Could not start mining (already mining?)");
             }
             json result;
+            const bool onGpu = ctx.miner->UsingGpu();
             result["mining"]  = true;
-            result["threads"] = threads;
+            result["device"]  = onGpu ? "gpu" : "cpu";
+            result["threads"] = onGpu ? 1 : threads;
             result["address"] = addrStr;
             return result;
         }

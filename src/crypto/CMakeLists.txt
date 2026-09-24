@@ -25,6 +25,7 @@ target_include_directories(moneu_crypto PUBLIC
 target_compile_options(moneu_crypto PRIVATE
     -DED25519_CUSTOMHASH
     -DED25519_CUSTOMRANDOM
+    -DSHA2_UNROLL_TRANSFORM
 )
 
 # OpenSSL provides AES-256-CBC for secure_enc.cpp. PUBLIC so every library

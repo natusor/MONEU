@@ -401,8 +401,8 @@ static void PrintUsage() {
         << "Mining commands:\n"
         << "  getmininginfo        "
            "PoW consensus status\n"
-        << "  startmining <address> [threads]  "
-           "Mine to that address\n"
+        << "  startmining <address> [threads] [gpu]  "
+           "Mine to that address, add gpu to use a graphics card\n"
         << "  stopmining           "
            "Stop mining\n\n"
         << "Examples:\n"
@@ -538,7 +538,7 @@ static bool IsTextArgument(const std::string& command, size_t pos) {
     if (command == "sendtoaddress") {
         return pos == 0 || pos == 2 || pos == 3;
     }
-    if (command == "startmining")  return pos == 0;
+    if (command == "startmining")  return pos == 0 || pos == 2;
     if (command == "getblock" || command == "getrawtransaction" ||
         command == "sendrawtransaction" || command == "addnode") {
         return pos == 0;

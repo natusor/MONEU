@@ -145,8 +145,8 @@ void Config::ApplyRPCValues() {
     mRPC.rpcUser     = GetValue("rpcuser", "");
     mRPC.rpcPassword = GetValue("rpcpassword", "");
     if (mRPC.rpcUser.empty() || mRPC.rpcPassword.empty()) {
-        std::cerr << "Config: WARNING - rpcuser or rpcpassword not set!\n";
-        std::cerr << "Config: RPC will be disabled for security.\n";
+        std::cerr << "Config: no rpcpassword set, node is now using cookie authentication\n";
+
         mRPC.rpcEnabled = false;
     } else {
         mRPC.rpcEnabled = true;

@@ -10,6 +10,8 @@
 #include "storage/chain_state.h"
 #include "consensus/pow.h"
 #include "crypto/arith_uint256.h"
+#include "node/gpu_miner.h"
+#include "node/miner_kernel.h"
 
 #include <chrono>
 #include <cstring>
@@ -48,6 +50,7 @@ Miner::Miner(storage::ChainState* chainState,
     : mChainState(chainState)
     , mMempool(mempool)
     , mConnManager(connManager)
+    , mUseGpu(false)
     , mChainSync()
     , mMining(false)
     , mStop(false)
@@ -213,6 +216,154 @@ void Miner::ReportRate(int workerId, double rate) {
     }
 }
 
+void Miner::BuildMiningBlocks(const BlockHeader& hdr,
+                              uint32_t midstate[8],
+                              uint32_t block2[16],
+                              uint32_t block3[16]) const {
+    uint8_t buf[BlockHeader::SERIALIZED_SIZE];
+    if (!hdr.SerializeTo(buf, sizeof(buf))) {
+        return;
+    }
+    uint32_t block1[16];
+    for (int i = 0; i < 16; ++i) {
+        block1[i] = ((uint32_t)buf[i*4]     << 24) |
+                    ((uint32_t)buf[i*4 + 1] << 16) |
+                    ((uint32_t)buf[i*4 + 2] << 8)  |
+                    ((uint32_t)buf[i*4 + 3]);
+    }
+    static const uint32_t iv[8] = {
+        0x6a09e667UL, 0xbb67ae85UL, 0x3c6ef372UL, 0xa54ff53aUL,
+        0x510e527fUL, 0x9b05688cUL, 0x1f83d9abUL, 0x5be0cd19UL };
+    sha256_Transform(iv, block1, midstate);
+
+    for (int i = 0; i < 14; ++i) {
+        const size_t o = 64 + i*4;
+        block2[i] = ((uint32_t)buf[o]     << 24) |
+                    ((uint32_t)buf[o + 1] << 16) |
+                    ((uint32_t)buf[o + 2] << 8)  |
+                    ((uint32_t)buf[o + 3]);
+    }
+    block2[14] = 0x80000000UL;
+    block2[15] = 0;
+
+    for (int i = 0; i < 15; ++i) block3[i] = 0;
+    block3[15] = BlockHeader::SERIALIZED_SIZE * 8;
+}
+
+bool Miner::RunNonceLoopGpu(Block& block, int workerId)
+{
+    BlockHeader& hdr = block.GetMutableHeader();
+    const uint32_t bits = hdr.GetBits();
+
+    PNC::arith_uint256 target;
+    bool neg = false, over = false;
+    target.SetCompact(bits, &neg, &over);
+    if (neg || over || target == 0) {
+        return false;
+    }
+
+    uint32_t targetTop = 0;
+    {
+        const bytes32 tb = PNC::ArithToBytes32(target);
+        targetTop = ((uint32_t)tb[0] << 24) | ((uint32_t)tb[1] << 16) |
+                    ((uint32_t)tb[2] << 8)  | ((uint32_t)tb[3]);
+    }
+
+    uint32_t midstate[8];
+    uint32_t block2[16];
+    uint32_t block3[16];
+    BuildMiningBlocks(hdr, midstate, block2, block3);
+
+    const bytes32 builtOn = hdr.GetPrevBlockHash();
+    uint64_t startMs = NowMillis();
+    uint64_t localHashes = 0;
+
+    const uint32_t BATCH = 1u << 20;
+
+    uint64_t nonceBase = 0;
+
+    while (mMining.load() && !mStop.load()) {
+        if (mChainState &&
+            !(mChainState->GetBestBlockHash() == builtOn)) {
+            break;
+        }
+        if (NowMillis() - startMs > TEMPLATE_REFRESH_MS) {
+            break;
+        }
+
+        uint32_t start = (uint32_t)nonceBase;
+        uint32_t count = BATCH;
+        if (nonceBase + count > 0x100000000ULL) {
+            count = (uint32_t)(0x100000000ULL - nonceBase);
+        }
+
+        uint32_t foundNonce = 0;
+        std::string reason;
+        bool hit = mGpu.Search(midstate, block2, block3,
+                               targetTop, start, count, foundNonce, reason);
+
+        localHashes += count;
+        mHashCount.fetch_add(count, std::memory_order_relaxed);
+
+        if (!reason.empty()) {
+            MONEU_LOG_WARN("Miner: GPU error, falling back to CPU (" +
+                           reason + ")");
+            mUseGpu.store(false);
+            return false;
+        }
+
+        if (hit) {
+            uint32_t b2[16];
+            for (int i = 0; i < 16; ++i) b2[i] = block2[i];
+            b2[13] = ((foundNonce & 0x000000FFu) << 24) |
+                     ((foundNonce & 0x0000FF00u) << 8)  |
+                     ((foundNonce & 0x00FF0000u) >> 8)  |
+                     ((foundNonce & 0xFF000000u) >> 24);
+            uint32_t state[8], hw[8];
+            sha256_Transform(midstate, b2, state);
+            sha256_Transform(state, block3, hw);
+
+            bytes32 hash;
+            for (int i = 0; i < 8; ++i) {
+                hash[i*4]     = (uint8_t)(hw[i] >> 24);
+                hash[i*4 + 1] = (uint8_t)(hw[i] >> 16);
+                hash[i*4 + 2] = (uint8_t)(hw[i] >> 8);
+                hash[i*4 + 3] = (uint8_t)(hw[i]);
+            }
+            if (PNC::ArithFromBytes32(hash) <= target) {
+                hdr.SetNonce(foundNonce);
+                const uint64_t elapsed = NowMillis() - startMs;
+                if (elapsed > 0) {
+                    ReportRate(workerId, (double)localHashes * 1000.0 /
+                                         (double)elapsed);
+                }
+                return true;
+            }
+            nonceBase = (uint64_t)foundNonce + 1;
+        } else {
+            nonceBase += count;
+        }
+
+        if (nonceBase >= 0x100000000ULL) {
+            hdr.SetTimestamp(NowSeconds());
+            BuildMiningBlocks(hdr, midstate, block2, block3);
+            nonceBase = 0;
+        }
+
+        const uint64_t sinceStart = NowMillis() - startMs;
+        if (sinceStart > 0) {
+            ReportRate(workerId, (double)localHashes * 1000.0 /
+                                 (double)sinceStart);
+        }
+    }
+
+    const uint64_t elapsed = NowMillis() - startMs;
+    if (elapsed > 0 && localHashes > 0) {
+        ReportRate(workerId, (double)localHashes * 1000.0 / (double)elapsed);
+    }
+    return false;
+}
+
 bool Miner::RunNonceLoop(Block& block, int workerId)
 {
     BlockHeader& hdr = block.GetMutableHeader();
@@ -238,39 +389,12 @@ bool Miner::RunNonceLoop(Block& block, int workerId)
                     ((uint32_t)tb[2] << 8)  | ((uint32_t)tb[3]);
     }
 
-    uint8_t  buf[BlockHeader::SERIALIZED_SIZE];
     uint32_t midstate[8];
     uint32_t block2[16];
     uint32_t block3[16];
 
     auto prepare = [&]() {
-        if (!hdr.SerializeTo(buf, sizeof(buf))) {
-            return;
-        }
-        uint32_t block1[16];
-        for (int i = 0; i < 16; ++i) {
-            block1[i] = ((uint32_t)buf[i*4]     << 24) |
-                        ((uint32_t)buf[i*4 + 1] << 16) |
-                        ((uint32_t)buf[i*4 + 2] << 8)  |
-                        ((uint32_t)buf[i*4 + 3]);
-        }
-        static const uint32_t iv[8] = {
-            0x6a09e667UL, 0xbb67ae85UL, 0x3c6ef372UL, 0xa54ff53aUL,
-            0x510e527fUL, 0x9b05688cUL, 0x1f83d9abUL, 0x5be0cd19UL };
-        sha256_Transform(iv, block1, midstate);
-
-        for (int i = 0; i < 14; ++i) {
-            const size_t o = 64 + i*4;
-            block2[i] = ((uint32_t)buf[o]     << 24) |
-                        ((uint32_t)buf[o + 1] << 16) |
-                        ((uint32_t)buf[o + 2] << 8)  |
-                        ((uint32_t)buf[o + 3]);
-        }
-        block2[14] = 0x80000000UL;
-        block2[15] = 0;
-
-        for (int i = 0; i < 15; ++i) block3[i] = 0;
-        block3[15] = BlockHeader::SERIALIZED_SIZE * 8;
+        BuildMiningBlocks(hdr, midstate, block2, block3);
     };
 
     prepare();
@@ -381,7 +505,16 @@ void Miner::WorkerLoop(int workerId)
 
         const bytes32 builtOn = block.GetHeader().GetPrevBlockHash();
 
-        if (RunNonceLoop(block, workerId)) {
+        bool okBlock;
+        if (mUseGpu.load()) {
+            okBlock = RunNonceLoopGpu(block, workerId);
+            if (!okBlock && !mUseGpu.load()) {
+                okBlock = RunNonceLoop(block, workerId);
+            }
+        } else {
+            okBlock = RunNonceLoop(block, workerId);
+        }
+        if (okBlock) {
             {
                 std::lock_guard<std::mutex> lock(mFoundMutex);
                 mFound.push(block);
@@ -455,7 +588,8 @@ bool Miner::SubmitBlock(const Block& block)
     return true;
 }
 
-bool Miner::Start(const bytes32& coinbaseOutputHash, int threads)
+bool Miner::Start(const bytes32& coinbaseOutputHash, int threads,
+                  bool useGpu)
 {
     if (mMining.load()) {
         MONEU_LOG_WARN("Miner: already running");
@@ -473,6 +607,19 @@ bool Miner::Start(const bytes32& coinbaseOutputHash, int threads)
     if (threads < 1) threads = 1;
     if (threads > MAX_THREADS) threads = MAX_THREADS;
 
+    mUseGpu.store(false);
+    if (useGpu) {
+        std::string gpuReason;
+        if (mGpu.Init(MONEU_MINER_KERNEL_SRC, gpuReason)) {
+            mUseGpu.store(true);
+            threads = 1;
+            MONEU_LOG_INFO("Miner: GPU ready: " + mGpu.DeviceName());
+        } else {
+            MONEU_LOG_WARN("Miner: GPU requested but not available (" +
+                           gpuReason + "), mining on CPU");
+        }
+    }
+
     mCoinbaseOutputHash = coinbaseOutputHash;
     mStop.store(false);
     mMining.store(true);
@@ -487,8 +634,9 @@ bool Miner::Start(const bytes32& coinbaseOutputHash, int threads)
     }
     mSubmitter = std::thread(&Miner::SubmitLoop, this);
 
-    MONEU_LOG_INFO("Miner: started on " + std::to_string(threads) +
-                   " thread(s)");
+    MONEU_LOG_INFO(std::string("Miner: started on ") +
+                   (mUseGpu.load() ? "GPU" : std::to_string(threads) +
+                    " CPU thread(s)"));
     return true;
 }
 

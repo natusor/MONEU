@@ -28,6 +28,7 @@ target_link_libraries(moneu_chainparams
 add_executable(moneud
     main.cpp
     miner.cpp
+    node/gpu_miner.cpp
 )
 target_link_libraries(moneud
     -Wl,--start-group
@@ -46,6 +47,7 @@ target_link_libraries(moneud
     ${Boost_LIBRARIES}
     ${OPENSSL_LIBRARIES}
     Threads::Threads
+    ${CMAKE_DL_LIBS}
 )
 add_executable(moneu-cli
     moneu-cli.cpp
