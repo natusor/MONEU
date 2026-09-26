@@ -534,6 +534,7 @@ bool ConnManager::IsAlreadyConnected(const NetAddress& addr) const {
 }
 
 bool ConnManager::ConnectToAddress(const NetAddress& addr) {
+    if (IsOwnAddress(addr)) return false;
     if (IsIPBanned(addr.ip)) return false;
     mAddrMan.Attempt(addr.ip, addr.port, GetCurrentTimestamp());
     if (IsAlreadyConnected(addr)) return false;
@@ -1951,6 +1952,25 @@ void ConnManager::DiscoverLocalAddresses() {
     }
 }
 
+bool ConnManager::IsOwnAddress(const NetAddress& addr) const {
+    if (addr.ip.empty()) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(mAddrMutex);
+        if (!mExternalAddress.ip.empty() &&
+            mExternalAddress.ip == addr.ip &&
+            (mExternalAddress.port == addr.port || addr.port == 0)) {
+            return true;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(mLocalAddrMutex);
+    for (size_t i = 0; i < mLocalAddresses.size(); ++i) {
+        if (mLocalAddresses[i].ip == addr.ip) return true;
+    }
+    return false;
+}
+
 bool ConnManager::SelectLocalAddressFor(const NetAddress& peer,
                                         NetAddress& out) const {
     std::lock_guard<std::mutex> lock(mLocalAddrMutex);
@@ -2159,6 +2179,7 @@ void ConnManager::AddOperatorAddress(const NetAddress& addr) {
 bool ConnManager::AddKnownAddressFrom(
     const NetAddress& addr, const std::string& source)
 {
+    if (IsOwnAddress(addr)) return false;
     if (!IsRelayableAddress(addr.ip)) return false;
 
     const int64_t now = GetCurrentTimestamp();

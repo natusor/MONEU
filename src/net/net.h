@@ -542,6 +542,11 @@ public:
 
     void SetExternalAddress(const std::string& ip, uint16_t port);
 
+    // True when the address is one of ours: a local interface address or the
+    // one given as externalip. Checked before every outbound attempt so the
+    // node never dials itself, whatever route the address arrived by.
+    bool IsOwnAddress(const NetAddress& addr) const;
+
     void AdvertiseSelf(NodePtr node);
 
     void DiscoverLocalAddresses();
