@@ -1441,7 +1441,10 @@ void RPCServer::RegisterBuiltinCommands() {
     mTable.Register(RPCCommand(
         "control", "stop",
         "stop - Gracefully stop the MONEU node",
-        [](const RPCRequest&, const RPCContext&) -> json {
+        [](const RPCRequest& req, const RPCContext&) -> json {
+            if (req.params.is_array() && !req.params.empty())
+                throw RPCError(RPC_INVALID_PARAMS,
+                    "stop takes no arguments. Did you mean stopmining?");
             MONEU_LOG_INFO("RPC: stop requested");
             std::thread([]() {
                 std::this_thread::sleep_for(
