@@ -42,6 +42,7 @@ extern "C" {
 #include "consensus/mempool.h"
 #include "node/node_identity.h"
 #include "net/net.h"
+#include "net/portmap.h"
 #include "rpc/rpc_server.h"
 #include "consensus/pow.h"
 #include "validation/block_validation.h"
@@ -406,6 +407,7 @@ public:
     std::shared_ptr<Mempool>             mempool;
     std::unique_ptr<node::NodeIdentity>  nodeIdentity;
     std::shared_ptr<net::ConnManager>    connManager;
+    std::unique_ptr<net::PortMapper>     portMapper;
     std::unique_ptr<node::WalletManager> wallet;
     std::unique_ptr<node::Miner>         miner;
     std::unique_ptr<rpc::RPCServer>      rpcServer;
@@ -425,6 +427,10 @@ public:
 
         if (miner) {
             miner->Stop();
+        }
+        if (portMapper) {
+            portMapper->Stop();
+            portMapper.reset();
         }
         if (connManager) {
             connManager->Interrupt();
@@ -938,6 +944,19 @@ int main(int argc, char* argv[]) {
         }
         LOG_INFO("P2P OK: port=" +
             std::to_string(netOptions.listenPort));
+
+        // A node behind a home router takes no incoming connections unless
+        // the router forwards the port. Asking it costs one short exchange
+        // and the node carries on either way.
+        if (node.config.GetNetwork().listen &&
+            node.config.GetNetwork().portMap) {
+            node.portMapper = std::unique_ptr<net::PortMapper>(
+                new net::PortMapper());
+            node.portMapper->Start(netOptions.listenPort);
+        } else if (node.config.GetNetwork().listen) {
+            LOG_INFO("Port mapping is off. Other nodes reach this one only "
+                     "if the port is already forwarded.");
+        }
 
         LOG_INFO("[5/6] Starting RPC server...");
         bool useCookieAuth = false;

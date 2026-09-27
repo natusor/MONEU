@@ -35,6 +35,13 @@ struct NetworkConfig {
     bool        listen;
     bool        upnp;
 
+    // Ask the home router to forward the listening port, so that other nodes
+    // can reach this one. On by default whenever the node listens at all: a
+    // node nobody can reach adds no entry point to the network, and most
+    // people never touch their router. Set portmap=0 to leave the router
+    // alone.
+    bool        portMap;
+
     std::string externalIp;
     std::vector<std::string> seedNodes;
     std::vector<std::string> addNodes;
@@ -48,6 +55,7 @@ struct NetworkConfig {
         , maxInbound(NetParams::MAX_INBOUND_CONNECTIONS)
         , listen(true)
         , upnp(false)
+        , portMap(true)
     {}
 };
 

@@ -1,6 +1,7 @@
 add_library(moneu_net STATIC
     addrman.cpp
     net.cpp
+    portmap.cpp
 )
 
 target_include_directories(moneu_net PUBLIC

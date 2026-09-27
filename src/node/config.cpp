@@ -129,6 +129,7 @@ void Config::ApplyNetworkValues() {
     );
     mNetwork.listen = GetBoolValue("listen", true);
     mNetwork.upnp   = GetBoolValue("upnp", false);
+    mNetwork.portMap = GetBoolValue("portmap", true);
     mNetwork.externalIp = GetValue("externalip", "");
     const std::vector<std::string> addNodes = GetListValues("addnode");
     for (size_t i = 0; i < addNodes.size(); ++i) {
@@ -294,6 +295,7 @@ void Config::PrintConfig() const {
     std::cerr << "  maxoutbound:    " << mNetwork.maxOutbound    << "\n";
     std::cerr << "  maxinbound:     " << mNetwork.maxInbound     << "\n";
     std::cerr << "  listen:         " << mNetwork.listen         << "\n";
+    std::cerr << "  portmap:        " << mNetwork.portMap        << "\n";
     std::cerr << "Mining:\n";
     std::cerr << "  enabled:        " << mMining.enabled << "\n";
     std::cerr << "  reward address: "
