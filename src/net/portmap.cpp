@@ -298,12 +298,12 @@ void PortMapper::Stop() {
 }
 
 void PortMapper::Loop(uint16_t privatePort) {
+    // No gateway means nothing to ask, which is the normal case on a machine
+    // with a public address of its own. Nothing is written: the node is not
+    // worse off than before, and a line about it would only look like a
+    // fault where there is none.
     const std::string gateway = FindDefaultGateway();
     if (gateway.empty()) {
-        MONEU_LOG_INFO(
-            "Port mapping: no gateway on this machine, nothing to ask. "
-            "Incoming connections work only if this address is reachable "
-            "already.");
         mRunning = false;
         return;
     }
@@ -351,21 +351,11 @@ void PortMapper::Loop(uint16_t privatePort) {
             continue;
         }
 
-        if (mMapped.load()) {
-            // It worked before, so this is most likely a lost packet or a
-            // router that just restarted. Say so once and keep trying.
-            MONEU_LOG_INFO(
-                "Port mapping: the router stopped answering, trying again "
-                "in a few minutes.");
-        } else if (!announced) {
-            MONEU_LOG_INFO(
-                "Port mapping: the router did not grant a forward for port " +
-                std::to_string(privatePort) + ". The node works and mines as "
-                "usual, but other nodes cannot reach it. Forward the port by "
-                "hand to let them in.");
-            announced = true;
-        }
-
+        // A router that says no is not a fault: most of them are set to
+        // refuse, and the node runs exactly as it did before. Nothing is
+        // written, so nobody reads a warning into a state that is normal.
+        // The loop keeps asking, so turning the setting on in the router
+        // later is noticed by itself.
         mMapped = false;
         if (!WaitFor(RETRY_SECONDS)) break;
     }
@@ -375,9 +365,7 @@ void PortMapper::Loop(uint16_t privatePort) {
     if (mMapped.load()) {
         uint16_t ignored = 0;
         const uint16_t mapped = mExternalPort.load();
-        if (AskMapping(gateway, privatePort, mapped, 0, ignored)) {
-            MONEU_LOG_INFO("Port mapping: the forward has been removed.");
-        }
+        AskMapping(gateway, privatePort, mapped, 0, ignored);
     }
 
     mMapped = false;
