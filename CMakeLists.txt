@@ -41,6 +41,25 @@ endif()
 set(CMAKE_EXE_LINKER_FLAGS
     "${CMAKE_EXE_LINKER_FLAGS} -Wl,-z,relro -Wl,-z,now")
 
+# A node built the ordinary way loads LevelDB, OpenSSL, Boost and Snappy from
+# the system at every start, so it only runs where those are installed. That
+# is fine when you built it yourself, and no use at all for a binary someone
+# downloads. With -DSTATIC_DEPS=ON the four are compiled into the binary
+# instead: it grows, and in return it starts on any machine of the same
+# architecture with nothing installed beyond the C library.
+option(STATIC_DEPS "Build the dependencies into the binaries" OFF)
+
+if(STATIC_DEPS)
+    # Ask CMake for the .a form of everything it looks up below.
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+    set(Boost_USE_STATIC_LIBS ON)
+    set(OPENSSL_USE_STATIC_LIBS ON)
+    # libstdc++ and libgcc travel with the binary as well, so a machine with
+    # an older compiler runtime than the build host still runs it.
+    set(CMAKE_EXE_LINKER_FLAGS
+        "${CMAKE_EXE_LINKER_FLAGS} -static-libstdc++ -static-libgcc")
+endif()
+
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Boost 1.74 REQUIRED COMPONENTS
@@ -54,6 +73,15 @@ find_path(LEVELDB_INCLUDE_DIR leveldb/db.h)
 find_library(LEVELDB_LIBRARY leveldb)
 if(NOT LEVELDB_INCLUDE_DIR OR NOT LEVELDB_LIBRARY)
     message(FATAL_ERROR "LevelDB not found!")
+endif()
+
+if(STATIC_DEPS)
+    # LevelDB is built on Snappy, and a static LevelDB does not carry it
+    # along the way a shared one does, so it has to be named here.
+    find_library(SNAPPY_LIBRARY snappy)
+    if(SNAPPY_LIBRARY)
+        set(LEVELDB_LIBRARY ${LEVELDB_LIBRARY} ${SNAPPY_LIBRARY})
+    endif()
 endif()
 
 include_directories(
