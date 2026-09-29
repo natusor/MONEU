@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 
@@ -24,14 +25,35 @@ namespace net {
 
 namespace {
 
-// The port every NAT-PMP router listens on, fixed by RFC 6886.
+// Both protocols use this port, fixed by RFC 6886 and kept by RFC 6887.
 const uint16_t NATPMP_PORT = 5351;
 
-// The only version of the protocol.
+// NAT-PMP has only ever had one version. PCP took the next number, which is
+// how a router tells the two apart: the first byte of the request.
 const uint8_t NATPMP_VERSION = 0;
+const uint8_t PCP_VERSION    = 2;
 
 const uint8_t OP_ASK_ADDRESS = 0;
 const uint8_t OP_MAP_TCP     = 2;
+
+// PCP opcodes. MAP asks for an incoming port, which is what a node needs.
+const uint8_t PCP_OP_MAP = 1;
+
+// PCP marks an answer with the top bit of the opcode byte rather than by
+// adding 128 to the opcode the way NAT-PMP does.
+const uint8_t PCP_RESPONSE_BIT = 0x80;
+
+// The protocol number for TCP, as used inside a PCP MAP request.
+const uint8_t PCP_PROTOCOL_TCP = 6;
+
+// A PCP request is 24 bytes of header and, for MAP, 36 bytes after it.
+const size_t PCP_REQUEST_SIZE  = 60;
+
+// An answer is 24 bytes of header and 36 after it as well.
+const size_t PCP_RESPONSE_SIZE = 60;
+
+// Result code zero in a PCP answer means the router agreed.
+const uint8_t PCP_SUCCESS = 0;
 
 // A router answers with the opcode plus 128.
 const uint8_t OP_ANSWER_FLAG = 128;
@@ -64,6 +86,23 @@ uint16_t ReadBE16(const uint8_t* in) {
         (static_cast<uint16_t>(in[0]) << 8) | static_cast<uint16_t>(in[1]));
 }
 
+// PCP carries every address as sixteen bytes, so an IPv4 address travels as
+// the IPv4-mapped IPv6 form: eighty zero bits, sixteen one bits, then the
+// four bytes themselves.
+void WriteMappedV4(uint8_t out[16], const struct in_addr& addr) {
+    std::memset(out, 0, 16);
+    out[10] = 0xFF;
+    out[11] = 0xFF;
+    std::memcpy(&out[12], &addr.s_addr, 4);
+}
+
+bool IsMappedV4(const uint8_t in[16]) {
+    for (int i = 0; i < 10; ++i) {
+        if (in[i] != 0) return false;
+    }
+    return in[10] == 0xFF && in[11] == 0xFF;
+}
+
 } // namespace
 
 PortMapper::PortMapper()
@@ -71,6 +110,7 @@ PortMapper::PortMapper()
     , mStopping(false)
     , mMapped(false)
     , mExternalPort(0)
+    , mProtocol(PROTO_NONE)
 {}
 
 PortMapper::~PortMapper() {
@@ -176,6 +216,52 @@ size_t PortMapper::Exchange(const std::string& gateway,
 #endif
 }
 
+bool PortMapper::FindLocalAddressTowards(const std::string& gateway,
+                                        uint8_t addrOut[16])
+{
+#ifndef WIN32
+    // A PCP request names the host the mapping is for, and on a machine with
+    // several addresses only the kernel knows which one leads to the gateway.
+    // Connecting a UDP socket sends nothing, but it makes the kernel pick a
+    // route, and the chosen address can then be read back.
+    if (gateway.empty()) return false;
+
+    const int sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return false;
+
+    struct sockaddr_in to;
+    std::memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port   = htons(NATPMP_PORT);
+    if (inet_pton(AF_INET, gateway.c_str(), &to.sin_addr) != 1) {
+        ::close(sock);
+        return false;
+    }
+
+    if (::connect(sock, reinterpret_cast<struct sockaddr*>(&to),
+                  sizeof(to)) != 0) {
+        ::close(sock);
+        return false;
+    }
+
+    struct sockaddr_in local;
+    socklen_t localLen = sizeof(local);
+    std::memset(&local, 0, sizeof(local));
+    const int got = ::getsockname(
+        sock, reinterpret_cast<struct sockaddr*>(&local), &localLen);
+    ::close(sock);
+
+    if (got != 0) return false;
+    if (local.sin_addr.s_addr == 0) return false;
+
+    WriteMappedV4(addrOut, local.sin_addr);
+    return true;
+#else
+    (void)gateway; (void)addrOut;
+    return false;
+#endif
+}
+
 bool PortMapper::AskExternalAddress(const std::string& gateway,
                                     std::string& addressOut)
 {
@@ -212,11 +298,96 @@ bool PortMapper::AskExternalAddress(const std::string& gateway,
     return false;
 }
 
-bool PortMapper::AskMapping(const std::string& gateway,
-                            uint16_t privatePort,
-                            uint16_t suggestedExternalPort,
-                            uint32_t lifetimeSeconds,
-                            uint16_t& grantedPortOut)
+bool PortMapper::AskMappingPCP(const std::string& gateway,
+                               uint16_t privatePort,
+                               uint16_t suggestedExternalPort,
+                               uint32_t lifetimeSeconds,
+                               uint16_t& grantedPortOut,
+                               std::string& externalAddressOut)
+{
+#ifndef WIN32
+    uint8_t client[16];
+    if (!FindLocalAddressTowards(gateway, client)) return false;
+
+    // The nonce ties an answer to this request and lets the router recognise
+    // a renewal as the same mapping rather than a new one. It is drawn once
+    // per mapping and kept for as long as the node holds it.
+    static uint8_t nonce[12];
+    static bool nonceReady = false;
+    if (!nonceReady) {
+        // The clock and the address are enough here: the nonce is not a
+        // secret, it only has to be unlikely to repeat.
+        const uint64_t now =
+            static_cast<uint64_t>(std::time(NULL));
+        std::memcpy(&nonce[0], &now, 8);
+        std::memcpy(&nonce[8], &client[12], 4);
+        nonceReady = true;
+    }
+
+    uint8_t request[PCP_REQUEST_SIZE];
+    std::memset(request, 0, sizeof(request));
+
+    // Header: version, opcode, two reserved bytes, lifetime, then the
+    // address of the host asking.
+    request[0] = PCP_VERSION;
+    request[1] = PCP_OP_MAP;
+    WriteBE32(&request[4], lifetimeSeconds);
+    std::memcpy(&request[8], client, 16);
+
+    // MAP body: the nonce, the protocol, three reserved bytes, the port on
+    // this side, the port asked for outside, and the address asked for.
+    // Zeroes in the last field let the router choose, which is what a home
+    // connection with a changing address needs.
+    std::memcpy(&request[24], nonce, 12);
+    request[36] = PCP_PROTOCOL_TCP;
+    WriteBE16(&request[40], privatePort);
+    WriteBE16(&request[42], suggestedExternalPort);
+
+    uint8_t response[PCP_RESPONSE_SIZE];
+
+    for (int attempt = 0; attempt < REQUEST_ATTEMPTS; ++attempt) {
+        std::memset(response, 0, sizeof(response));
+        const size_t got = Exchange(gateway, request, sizeof(request),
+                                    response, sizeof(response),
+                                    REQUEST_TIMEOUT_MS);
+        if (got < PCP_RESPONSE_SIZE) continue;
+        if (response[0] != PCP_VERSION) continue;
+        if (response[1] != (PCP_OP_MAP | PCP_RESPONSE_BIT)) continue;
+        if (response[3] != PCP_SUCCESS) return false;
+
+        // The router repeats the nonce and the port on this side. Anything
+        // that does not match belongs to another program on this network.
+        if (std::memcmp(&response[24], nonce, 12) != 0) continue;
+        if (ReadBE16(&response[40]) != privatePort) continue;
+
+        grantedPortOut = ReadBE16(&response[42]);
+
+        // The assigned address comes back in the same answer, so unlike
+        // NAT-PMP there is no second exchange to make.
+        uint8_t assigned[16];
+        std::memcpy(assigned, &response[44], 16);
+        if (IsMappedV4(assigned)) {
+            struct in_addr addr;
+            std::memcpy(&addr.s_addr, &assigned[12], 4);
+            char text[INET_ADDRSTRLEN];
+            if (inet_ntop(AF_INET, &addr, text, sizeof(text))) {
+                externalAddressOut = text;
+            }
+        }
+        return true;
+    }
+#else
+    (void)gateway; (void)privatePort; (void)suggestedExternalPort;
+    (void)lifetimeSeconds; (void)grantedPortOut; (void)externalAddressOut;
+#endif
+    return false;
+}
+
+bool PortMapper::AskMappingNATPMP(const std::string& gateway,
+                                  uint16_t privatePort,
+                                  uint16_t suggestedExternalPort,
+                                  uint32_t lifetimeSeconds,
+                                  uint16_t& grantedPortOut)
 {
 #ifndef WIN32
     // Twelve bytes: version, opcode, two reserved, the port here, the port
@@ -270,6 +441,7 @@ bool PortMapper::Start(uint16_t privatePort) {
     mStopping = false;
     mMapped   = false;
     mExternalPort = 0;
+    mProtocol = PROTO_NONE;
     {
         std::lock_guard<std::mutex> lock(mAddressMutex);
         mExternalAddress.clear();
@@ -317,17 +489,40 @@ void PortMapper::Loop(uint16_t privatePort) {
 
     while (!mStopping.load()) {
         uint16_t granted = 0;
+        std::string external;
         const uint16_t suggested =
             mExternalPort.load() != 0 ? mExternalPort.load() : privatePort;
 
-        if (AskMapping(gateway, privatePort, suggested,
-                       MAPPING_LIFETIME_SECONDS, granted)) {
+        // PCP first, because it is what most routers of the last decade
+        // answer. A box that only knows NAT-PMP simply says nothing to a
+        // version it does not recognise, and the fallback below catches it.
+        // Once one of them has worked, the renewals go straight to it.
+        bool ok = false;
+        const int chosen = mProtocol.load();
+
+        if (chosen != PROTO_NATPMP) {
+            ok = AskMappingPCP(gateway, privatePort, suggested,
+                               MAPPING_LIFETIME_SECONDS, granted, external);
+            if (ok) mProtocol = PROTO_PCP;
+        }
+
+        if (!ok && chosen != PROTO_PCP) {
+            ok = AskMappingNATPMP(gateway, privatePort, suggested,
+                                  MAPPING_LIFETIME_SECONDS, granted);
+            if (ok) mProtocol = PROTO_NATPMP;
+        }
+
+        if (ok) {
             mExternalPort = granted;
             mMapped = true;
 
             if (!announced) {
-                std::string external;
-                if (AskExternalAddress(gateway, external)) {
+                // PCP hands the address back with the mapping. NAT-PMP needs
+                // a second exchange for it.
+                if (external.empty()) {
+                    AskExternalAddress(gateway, external);
+                }
+                if (!external.empty()) {
                     std::lock_guard<std::mutex> lock(mAddressMutex);
                     mExternalAddress = external;
                 }
@@ -364,8 +559,13 @@ void PortMapper::Loop(uint16_t privatePort) {
     // after the node is gone.
     if (mMapped.load()) {
         uint16_t ignored = 0;
+        std::string unused;
         const uint16_t mapped = mExternalPort.load();
-        AskMapping(gateway, privatePort, mapped, 0, ignored);
+        if (mProtocol.load() == PROTO_PCP) {
+            AskMappingPCP(gateway, privatePort, mapped, 0, ignored, unused);
+        } else {
+            AskMappingNATPMP(gateway, privatePort, mapped, 0, ignored);
+        }
     }
 
     mMapped = false;

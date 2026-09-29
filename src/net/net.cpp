@@ -347,7 +347,16 @@ bool ConnManager::Start(
 void ConnManager::Stop() {
     if (mThreads.empty()) return;
 
-    mRunning = false;
+    // The waiting threads test mRunning under mCvMutex, so the flag has to be
+    // cleared while that mutex is held. Setting it outside leaves a gap: a
+    // thread that has just read the old value, and has not yet begun to wait,
+    // misses the notification and sleeps out its whole interval. With a ping
+    // loop on a two minute timer that turned a shutdown into a two minute
+    // wait, which looked to anyone watching like the node had hung.
+    {
+        std::lock_guard<std::mutex> lock(mCvMutex);
+        mRunning = false;
+    }
 
     {
         boost::system::error_code ec;
@@ -381,7 +390,11 @@ void ConnManager::Stop() {
 }
 
 void ConnManager::Interrupt() {
-    mRunning = false;
+    // Cleared under mCvMutex for the same reason as in Stop below.
+    {
+        std::lock_guard<std::mutex> lock(mCvMutex);
+        mRunning = false;
+    }
     {
         boost::system::error_code ec;
         mAcceptor.cancel(ec);
@@ -563,10 +576,36 @@ bool ConnManager::ConnectToAddress(const NetAddress& addr) {
         node->socket.non_blocking(true, ec);
         if (ec) continue;
 
-        node->socket.connect(*it, ec);
-        if (ec == boost::asio::error::would_block ||
-            ec == boost::asio::error::in_progress) {
+        // The connect goes through the socket directly rather than through
+        // asio. Asio's synchronous connect polls with no timeout of its own,
+        // so it returns only once the kernel gives up resending the first
+        // packet, which takes over two minutes. The loop below never got a
+        // turn, and with it the check on mRunning: a shutdown waited out
+        // those two minutes, and during ordinary work one address nobody
+        // answers held up every other address behind it.
+        {
+            const int rc = ::connect(node->socket.native_handle(),
+                                     it->endpoint().data(),
+                                     it->endpoint().size());
+            if (rc == 0) {
+                ec = boost::system::error_code();
+            } else {
+                ec = boost::system::error_code(
+                    errno, boost::system::system_category());
+            }
+        }
+
+        if (ec.value() == EINPROGRESS || ec.value() == EWOULDBLOCK ||
+            ec.value() == EAGAIN) {
+            // Half a second at a time, so that a shutdown is noticed at
+            // once, and no more than CONNECT_TIMEOUT_SEC in total, so that
+            // an address nobody answers does not hold up the ones behind it.
+            const int64_t deadline =
+                GetCurrentTimestamp() + CONNECT_TIMEOUT_SEC;
+
             while (!connected && mRunning) {
+                if (GetCurrentTimestamp() >= deadline) break;
+
                 fd_set wfds;
                 FD_ZERO(&wfds);
                 FD_SET(node->socket.native_handle(), &wfds);

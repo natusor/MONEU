@@ -41,6 +41,12 @@ static const int64_t  PING_INTERVAL_SEC      = 120;
 static const int64_t  DOWNLOAD_CHECK_INTERVAL_SEC = 20;
 static const int64_t  TIMEOUT_SEC            = 1200;
 static const int64_t  HANDSHAKE_TIMEOUT_SEC  = 30;
+
+// How long to wait for one outbound connection to come up. The kernel keeps
+// resending the first packet for over two minutes before it gives up, which
+// is far longer than a node should spend on an address nobody answers when
+// there are others waiting behind it.
+static const int64_t  CONNECT_TIMEOUT_SEC    = 10;
 static const uint32_t MAX_INV_SIZE           = 50000;
 
 static const size_t   ADDR_RELAY_PEERS = 2;

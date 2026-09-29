@@ -24,10 +24,15 @@ namespace net {
 // of their own can take incoming connections, and in a young network those are
 // few.
 //
-// The protocol is NAT-PMP, RFC 6886: a short UDP exchange with the default
-// gateway on port 5351. Routers have supported it for years and it needs no
-// library, unlike UPnP, which Bitcoin dropped after repeated security holes in
-// the library it relied on.
+// Two protocols are spoken, both a short UDP exchange with the default gateway
+// on port 5351, and neither needing a library. PCP, RFC 6887, is tried first:
+// it is the newer of the two and the one most routers sold in the last decade
+// answer, AVM boxes among them. NAT-PMP, RFC 6886, is the fallback for older
+// boxes and for Apple hardware, which never spoke anything else.
+//
+// UPnP is not spoken at all. It carries XML and SOAP over a discovery protocol
+// of its own, and the library everyone used for it had holes often enough that
+// Bitcoin dropped it outright.
 //
 // The mapping expires by itself, so a thread renews it every twenty minutes.
 // If the router does not answer, the node writes one line to the log and works
@@ -85,16 +90,36 @@ private:
                            uint8_t* response, size_t responseCapacity,
                            int timeoutMs);
 
-    // Asks the router what address the outside world sees.
+    // Asks the router what address the outside world sees. NAT-PMP only: PCP
+    // hands the address back with the mapping itself.
     static bool AskExternalAddress(const std::string& gateway,
                                    std::string& addressOut);
 
-    // Asks for the mapping. A lifetime of zero removes it.
-    static bool AskMapping(const std::string& gateway,
-                           uint16_t privatePort,
-                           uint16_t suggestedExternalPort,
-                           uint32_t lifetimeSeconds,
-                           uint16_t& grantedPortOut);
+    // Asks for the mapping over PCP. A lifetime of zero removes it. The
+    // address the outside world sees comes back in the same answer, so it is
+    // filled in here too when the router gives one.
+    static bool AskMappingPCP(const std::string& gateway,
+                              uint16_t privatePort,
+                              uint16_t suggestedExternalPort,
+                              uint32_t lifetimeSeconds,
+                              uint16_t& grantedPortOut,
+                              std::string& externalAddressOut);
+
+    // Asks for the mapping over NAT-PMP. A lifetime of zero removes it.
+    static bool AskMappingNATPMP(const std::string& gateway,
+                                 uint16_t privatePort,
+                                 uint16_t suggestedExternalPort,
+                                 uint32_t lifetimeSeconds,
+                                 uint16_t& grantedPortOut);
+
+    // The address this machine reaches the gateway from. PCP carries it in
+    // the request, so the router can tell which host it is speaking for.
+    static bool FindLocalAddressTowards(const std::string& gateway,
+                                        uint8_t addrOut[16]);
+
+    // Which protocol the router answered last time, so a renewal does not
+    // start over from PCP on a box that only speaks NAT-PMP.
+    enum Protocol { PROTO_NONE = 0, PROTO_PCP, PROTO_NATPMP };
 
     // Sleeps unless Stop was called meanwhile. Returns false when it is time
     // to leave the loop.
@@ -105,6 +130,8 @@ private:
     std::atomic<bool>       mStopping;
     std::atomic<bool>       mMapped;
     std::atomic<uint16_t>   mExternalPort;
+
+    std::atomic<int>        mProtocol;
 
     mutable std::mutex      mAddressMutex;
     std::string             mExternalAddress;
