@@ -1,6 +1,9 @@
 // Copyright (c) 2025-2026 natusor (MONEU)
 // Distributed under the MIT software license
 
+#ifdef WIN32
+#undef NOGDI
+#endif
 #include "data_dir.h"
 #include <iostream>
 #include <fstream>
@@ -8,6 +11,7 @@
 #include <stdexcept>
 
 #ifdef WIN32
+#include <windows.h>
 #include <shlobj.h>
 #else
 #include <unistd.h>
@@ -19,7 +23,11 @@
 namespace MONEU {
 namespace node {
 
+#ifdef WIN32
+static HANDLE gLockHandle = INVALID_HANDLE_VALUE;
+#else
 static int gLockFd = -1;
+#endif
 
 fs::path DataDir::GetDefaultDataDir() {
 #ifdef WIN32
@@ -118,6 +126,18 @@ bool DataDir::CheckDiskSpace(uint64_t requiredBytes) const {
     }
     return true;
 #else
+    ULARGE_INTEGER available;
+    if (!::GetDiskFreeSpaceExA(mDataDir.string().c_str(),
+                               &available, NULL, NULL)) {
+        std::cerr << "DataDir: cannot check disk space\n";
+        return true;
+    }
+    if (available.QuadPart < requiredBytes) {
+        std::cerr << "DataDir: insufficient disk space! "
+                  << "Available: " << available.QuadPart / (1024 * 1024) << " MB, "
+                  << "Required: " << requiredBytes / (1024 * 1024) << " MB\n";
+        return false;
+    }
     return true;
 #endif
 }
@@ -147,6 +167,19 @@ bool DataDir::LockDataDir() {
     }
     return true;
 #else
+    fs::path lockFile = GetLockFilePath();
+    gLockHandle = ::CreateFileA(lockFile.string().c_str(),
+                                GENERIC_READ | GENERIC_WRITE,
+                                0,
+                                NULL,
+                                OPEN_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL,
+                                NULL);
+    if (gLockHandle == INVALID_HANDLE_VALUE) {
+        std::cerr << "DataDir: cannot lock " << lockFile.string()
+                  << " - another instance may be running!\n";
+        return false;
+    }
     return true;
 #endif
 }
@@ -156,6 +189,14 @@ void DataDir::UnlockDataDir() {
     if (gLockFd != -1) {
         close(gLockFd);
         gLockFd = -1;
+        try {
+            fs::remove(GetLockFilePath());
+        } catch (...) {}
+    }
+#else
+    if (gLockHandle != INVALID_HANDLE_VALUE) {
+        ::CloseHandle(gLockHandle);
+        gLockHandle = INVALID_HANDLE_VALUE;
         try {
             fs::remove(GetLockFilePath());
         } catch (...) {}
@@ -206,7 +247,10 @@ uint64_t DataDir::GetFreeDiskSpace() const {
     return static_cast<uint64_t>(stat.f_bavail) *
            static_cast<uint64_t>(stat.f_frsize);
 #else
-    return 0;
+    ULARGE_INTEGER available;
+    if (!::GetDiskFreeSpaceExA(mDataDir.string().c_str(),
+                               &available, NULL, NULL)) return 0;
+    return static_cast<uint64_t>(available.QuadPart);
 #endif
 }
 

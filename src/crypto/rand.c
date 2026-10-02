@@ -31,6 +31,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <errno.h>
+#ifdef WIN32
+#include <windows.h>
+#include <wincrypt.h>
+#endif
 
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -71,6 +75,23 @@ static void kernel_random(uint8_t *buf, size_t len) {
     if (filled == len) return;
 #endif
 
+#ifdef WIN32
+    {
+        HCRYPTPROV prov;
+        if (len - filled > 0xFFFFFFFFu ||
+            !CryptAcquireContextW(&prov, NULL, NULL, PROV_RSA_FULL,
+                                  CRYPT_VERIFYCONTEXT)) {
+            fprintf(stderr, "FATAL: no entropy source available\n");
+            abort();
+        }
+        if (!CryptGenRandom(prov, (DWORD)(len - filled), buf + filled)) {
+            CryptReleaseContext(prov, 0);
+            fprintf(stderr, "FATAL: entropy read failed\n");
+            abort();
+        }
+        CryptReleaseContext(prov, 0);
+    }
+#else
     {
         FILE *f = fopen("/dev/urandom", "rb");
         if (!f) {
@@ -85,6 +106,7 @@ static void kernel_random(uint8_t *buf, size_t len) {
             abort();
         }
     }
+#endif
 }
 
 void random_buffer(uint8_t *buf, size_t len) {

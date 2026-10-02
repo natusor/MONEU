@@ -66,6 +66,10 @@ static const uint32_t BLOCK_DOWNLOAD_WINDOW = 1024;
 
 static const int64_t  BLOCK_STALL_TIMEOUT_SEC = 60;
 
+static const int64_t  BLOCK_IN_FLIGHT_TIMEOUT_SEC = 1800;
+
+static const int64_t  BLOCK_PARENT_REREQUEST_SEC = 5;
+
 static const double   BLOCK_DOWNLOAD_TIMEOUT_BASE     = 1.0;
 static const double   BLOCK_DOWNLOAD_TIMEOUT_PER_PEER = 0.5;
 static const uint32_t MAX_ADDR_TO_SEND       = 1000;
@@ -210,7 +214,7 @@ public:
     NodeId              id;
     NetAddress          addr;
     bool                inbound;
-    bool                connected;
+    std::atomic<bool>   connected;
     bool                versionSent;
     bool                versionAcked;
     uint32_t            version;
@@ -384,6 +388,8 @@ private:
     mutable std::mutex                   mInFlightMutex;
 
     bool ShouldRequestBlock(const bytes32& hash, NodeId from);
+    size_t CountBlocksInFlightLocked(NodeId peer) const;
+    void ReRequestStalledParent(NodePtr node, const bytes32& parentHash);
 
     bool ShouldRequestTx(const bytes32& hash, NodeId from);
     void ClearTxInFlight(const bytes32& hash);

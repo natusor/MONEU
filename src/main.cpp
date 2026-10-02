@@ -26,6 +26,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#else
+#include <winsock2.h>
+#include <windows.h>
 #endif
 
 #include <boost/filesystem.hpp>
@@ -127,6 +130,17 @@ static void NotifyStartupComplete() {
     ::close(gStartupPipeWrite);
     gStartupPipeWrite = -1;
 }
+#else
+static HANDLE gStartupPipeWrite = NULL;
+
+static void NotifyStartupComplete() {
+    if (gStartupPipeWrite == NULL) return;
+    const char ok = 'K';
+    DWORD written = 0;
+    ::WriteFile(gStartupPipeWrite, &ok, 1, &written, NULL);
+    ::CloseHandle(gStartupPipeWrite);
+    gStartupPipeWrite = NULL;
+}
 #endif
 
 #ifndef WIN32
@@ -201,6 +215,118 @@ static void DetachStandardOutput() {
         ::dup2(devnull, STDERR_FILENO);
         if (devnull > STDERR_FILENO) ::close(devnull);
     }
+}
+#else
+static const char* const DAEMON_PIPE_ENV = "MONEU_DAEMON_PIPE";
+
+static bool Daemonize() {
+    char envValue[32];
+    const DWORD envLen = ::GetEnvironmentVariableA(
+        DAEMON_PIPE_ENV, envValue, sizeof(envValue));
+    if (envLen > 0 && envLen < sizeof(envValue)) {
+        ::SetEnvironmentVariableA(DAEMON_PIPE_ENV, NULL);
+        const unsigned long long raw = std::strtoull(envValue, NULL, 10);
+        gStartupPipeWrite =
+            reinterpret_cast<HANDLE>(static_cast<uintptr_t>(raw));
+        if (std::freopen("NUL", "r", stdin) == NULL) {
+            std::cerr << "MONEU: cannot detach standard input\n";
+        }
+        gDaemonized = true;
+        return true;
+    }
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength              = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle       = TRUE;
+
+    HANDLE readEnd  = NULL;
+    HANDLE writeEnd = NULL;
+    if (!::CreatePipe(&readEnd, &writeEnd, &sa, 0)) {
+        std::cerr << "MONEU: cannot create the startup pipe: error "
+                  << ::GetLastError() << "\n";
+        return false;
+    }
+    ::SetHandleInformation(readEnd, HANDLE_FLAG_INHERIT, 0);
+
+    std::vector<wchar_t> exePath(32768, L'\0');
+    const DWORD exeLen = ::GetModuleFileNameW(
+        NULL, exePath.data(), static_cast<DWORD>(exePath.size()));
+    if (exeLen == 0 || exeLen >= exePath.size()) {
+        ::CloseHandle(readEnd);
+        ::CloseHandle(writeEnd);
+        std::cerr << "MONEU: cannot find the node's own executable\n";
+        return false;
+    }
+
+    const std::wstring commandLine(::GetCommandLineW());
+    std::vector<wchar_t> commandBuf(commandLine.begin(), commandLine.end());
+    commandBuf.push_back(L'\0');
+
+    char handleText[32];
+    std::snprintf(handleText, sizeof(handleText), "%llu",
+                  static_cast<unsigned long long>(
+                      reinterpret_cast<uintptr_t>(writeEnd)));
+    ::SetEnvironmentVariableA(DAEMON_PIPE_ENV, handleText);
+
+    STARTUPINFOW si;
+    std::memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi;
+    std::memset(&pi, 0, sizeof(pi));
+
+    const BOOL created = ::CreateProcessW(
+        exePath.data(), commandBuf.data(), NULL, NULL, TRUE,
+        CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
+
+    ::SetEnvironmentVariableA(DAEMON_PIPE_ENV, NULL);
+    ::CloseHandle(writeEnd);
+
+    if (!created) {
+        ::CloseHandle(readEnd);
+        std::cerr << "MONEU: cannot fork into the background: error "
+                  << ::GetLastError() << "\n";
+        return false;
+    }
+    ::CloseHandle(pi.hThread);
+
+    char status = 0;
+    DWORD got = 0;
+    const BOOL readOk = ::ReadFile(readEnd, &status, 1, &got, NULL);
+    ::CloseHandle(readEnd);
+
+    if (readOk && got == 1 && status == 'K') {
+        std::cout << "\n"
+                  << "Node process ID is " << pi.dwProcessId << "\n"
+                  << "The log file is moneu.log inside the logs "
+                     "directory of your data directory.\n"
+                  << "To stop the node, type the command "
+                     "moneu-cli stop\n"
+                  << "\n"
+                  << "MONEU is running now.\n"
+                  << std::flush;
+        ::CloseHandle(pi.hProcess);
+        _exit(0);
+    }
+
+    ::CloseHandle(pi.hProcess);
+    std::cout << "MONEU failed to start. See the messages above.\n"
+              << std::flush;
+    _exit(1);
+}
+
+static void DetachStandardOutput() {
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(stdout);
+    std::fflush(stderr);
+    if (std::freopen("NUL", "w", stdout) == NULL) {
+        std::cerr << "MONEU: cannot detach standard output\n";
+    }
+    if (std::freopen("NUL", "w", stderr) == NULL) {
+        return;
+    }
+    ::FreeConsole();
 }
 #endif
 static bool          gLogToFile    = false;
@@ -341,13 +467,26 @@ static void SignalHandler(int signal) {
     gShutdown = true;
 }
 
+#ifdef WIN32
+static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
+    (void)ctrlType;
+    RequestShutdown();
+    Sleep(INFINITE);
+    return TRUE;
+}
+#endif
+
 static void PrintUsage(const char* argv0) {
     std::cout
         << "Usage: " << argv0 << " [options]\n\n"
         << "Options:\n"
         << "  -daemon             Run in the background and return the "
            "shell\n"
+#ifdef WIN32
+        << "  -datadir=<path>     Data directory (default: %APPDATA%\\MONEU)\n"
+#else
         << "  -datadir=<path>     Data directory (default: ~/.moneu)\n"
+#endif
         << "  -rpcuser=<user>     RPC username\n"
         << "  -rpcpassword=<pw>   RPC password\n"
         << "  -rpcallowip=<ip>    Allow RPC from IP\n"
@@ -358,7 +497,11 @@ static void PrintUsage(const char* argv0) {
         << "  -help               Show this help\n\n"
         << "To stop the node:\n"
         << "  moneu-cli stop\n\n"
+#ifdef WIN32
+        << "Config file: %APPDATA%\\MONEU\\moneu.conf\n"
+#else
         << "Config file: ~/.moneu/moneu.conf\n"
+#endif
         << "Example moneu.conf:\n"
         << "  rpcuser=alice\n"
         << "  rpcpassword=strongpassword\n\n";
@@ -578,7 +721,277 @@ static void SyncMempoolWithChain(MoneuNode& node)
     }
 }
 
+#ifdef MONEU_SINGLE_EXE
+#include "app/cli_exit.h"
+#include <io.h>
+#include <fcntl.h>
+
+int MoneuCliMain(int argc, char* argv[]);
+int MoneuTestMain();
+
+namespace {
+
+std::string AppTempLogPath() {
+    char dir[MAX_PATH];
+    const DWORD n = ::GetTempPathA(sizeof(dir), dir);
+    if (n == 0 || n >= sizeof(dir)) return std::string("moneu-check.log");
+    return std::string(dir) + "moneu-check.log";
+}
+
+int RunSelfTestQuietly(const std::string& logPath) {
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const int savedOut = ::_dup(1);
+    const int savedErr = ::_dup(2);
+    const int logFd = ::_open(logPath.c_str(),
+                              _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY,
+                              _S_IREAD | _S_IWRITE);
+    if (logFd >= 0) {
+        ::_dup2(logFd, 1);
+        ::_dup2(logFd, 2);
+    }
+    int result = 1;
+    try {
+        result = MoneuTestMain();
+    } catch (...) {
+        result = 1;
+    }
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(stdout);
+    std::fflush(stderr);
+    if (logFd >= 0) ::_close(logFd);
+    if (savedOut >= 0) { ::_dup2(savedOut, 1); ::_close(savedOut); }
+    if (savedErr >= 0) { ::_dup2(savedErr, 2); ::_close(savedErr); }
+    return result;
+}
+
+bool NodeAnswers() {
+    const SOCKET sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) return false;
+    sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(static_cast<u_short>(rpc::RPC_PORT));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const bool ok = ::connect(sock, reinterpret_cast<sockaddr*>(&addr),
+                              sizeof(addr)) == 0;
+    ::closesocket(sock);
+    return ok;
+}
+
+bool StartNodeInBackground(DWORD& pidOut) {
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength              = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle       = TRUE;
+
+    HANDLE readEnd  = NULL;
+    HANDLE writeEnd = NULL;
+    if (!::CreatePipe(&readEnd, &writeEnd, &sa, 0)) return false;
+    ::SetHandleInformation(readEnd, HANDLE_FLAG_INHERIT, 0);
+
+    std::vector<wchar_t> exePath(32768, L'\0');
+    const DWORD exeLen = ::GetModuleFileNameW(
+        NULL, exePath.data(), static_cast<DWORD>(exePath.size()));
+    if (exeLen == 0 || exeLen >= exePath.size()) {
+        ::CloseHandle(readEnd);
+        ::CloseHandle(writeEnd);
+        return false;
+    }
+
+    std::wstring commandLine = L"\"";
+    commandLine += exePath.data();
+    commandLine += L"\" -daemon";
+    std::vector<wchar_t> commandBuf(commandLine.begin(), commandLine.end());
+    commandBuf.push_back(L'\0');
+
+    char handleText[32];
+    std::snprintf(handleText, sizeof(handleText), "%llu",
+                  static_cast<unsigned long long>(
+                      reinterpret_cast<uintptr_t>(writeEnd)));
+    ::SetEnvironmentVariableA(DAEMON_PIPE_ENV, handleText);
+
+    STARTUPINFOW si;
+    std::memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi;
+    std::memset(&pi, 0, sizeof(pi));
+
+    const BOOL created = ::CreateProcessW(
+        exePath.data(), commandBuf.data(), NULL, NULL, TRUE,
+        CREATE_NEW_PROCESS_GROUP, NULL, NULL, &si, &pi);
+
+    ::SetEnvironmentVariableA(DAEMON_PIPE_ENV, NULL);
+    ::CloseHandle(writeEnd);
+
+    if (!created) {
+        ::CloseHandle(readEnd);
+        return false;
+    }
+    ::CloseHandle(pi.hThread);
+
+    char status = 0;
+    DWORD got = 0;
+    const BOOL readOk = ::ReadFile(readEnd, &status, 1, &got, NULL);
+    ::CloseHandle(readEnd);
+    ::CloseHandle(pi.hProcess);
+
+    pidOut = pi.dwProcessId;
+    return readOk && got == 1 && status == 'K';
+}
+
+std::vector<std::string> SplitCommand(const std::string& line) {
+    std::vector<std::string> out;
+    std::string current;
+    bool inQuotes = false;
+    bool hasToken = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (c == '"') {
+            inQuotes = !inQuotes;
+            hasToken = true;
+        } else if (!inQuotes && (c == ' ' || c == '\t')) {
+            if (hasToken) {
+                out.push_back(current);
+                current.clear();
+                hasToken = false;
+            }
+        } else {
+            current.push_back(c);
+            hasToken = true;
+        }
+    }
+    if (hasToken) out.push_back(current);
+    return out;
+}
+
+void PrintAppHelp() {
+    std::cout
+        << "\n"
+        << "Type a command and press Enter. The commands are the same as\n"
+        << "moneu-cli on Linux, without moneu-cli in front:\n"
+        << "\n"
+        << "  createwallet \"your-password\"\n"
+        << "  makenoise \"your-password\"\n"
+        << "  walletunlock \"your-password\"\n"
+        << "  getnewaddress\n"
+        << "  getwalletinfo\n"
+        << "  getbalance YOUR-ADDRESS\n"
+        << "  startmining YOUR-ADDRESS 2\n"
+        << "  getmininginfo\n"
+        << "  stopmining\n"
+        << "  getblockcount\n"
+        << "  help\n"
+        << "\n"
+        << "  stop      shut the node down\n"
+        << "  exit      close this window, the node keeps running\n"
+        << "\n";
+}
+
+int InteractiveMain() {
+    ::SetConsoleTitleA("MONEU");
+
+    WSADATA wsa;
+    if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        std::cerr << "error: cannot start Windows sockets\n";
+        std::cout << "Press Enter to close." << std::flush;
+        std::string ignored;
+        std::getline(std::cin, ignored);
+        return 1;
+    }
+
+    std::cout << "MONEU 0.2.2\n\n";
+
+    std::cout << "Checking this computer... " << std::flush;
+    const std::string logPath = AppTempLogPath();
+    if (RunSelfTestQuietly(logPath) != 0) {
+        std::cout << "FAILED\n\n"
+                  << "This computer did not pass the MONEU self test.\n"
+                  << "Details: " << logPath << "\n\n"
+                  << "Press Enter to close." << std::flush;
+        std::string ignored;
+        std::getline(std::cin, ignored);
+        ::WSACleanup();
+        return 1;
+    }
+    std::cout << "ALL TESTS PASSED\n";
+
+    if (NodeAnswers()) {
+        std::cout << "The node is already running.\n";
+    } else {
+        std::cout << "Starting the node...\n\n" << std::flush;
+        DWORD pid = 0;
+        if (!StartNodeInBackground(pid)) {
+            std::cout << "\nMONEU failed to start. See the messages above.\n\n"
+                      << "Press Enter to close." << std::flush;
+            std::string ignored;
+            std::getline(std::cin, ignored);
+            ::WSACleanup();
+            return 1;
+        }
+        std::cout << "\n"
+                  << "Node process ID is " << pid << "\n"
+                  << "The log file is moneu.log inside the logs "
+                     "directory of your data directory.\n"
+                  << "\n"
+                  << "MONEU is running now.\n";
+    }
+
+    PrintAppHelp();
+
+    std::string line;
+    while (true) {
+        std::cout << "moneu> " << std::flush;
+        if (!std::getline(std::cin, line)) break;
+
+        std::vector<std::string> words = SplitCommand(line);
+        if (words.empty()) continue;
+
+        if (words[0] == "moneu-cli" || words[0] == "moneu-cli.exe") {
+            words.erase(words.begin());
+            if (words.empty()) continue;
+        }
+
+        if (words[0] == "exit" || words[0] == "quit") break;
+
+        std::vector<std::string> argStore;
+        argStore.push_back("moneu-cli");
+        argStore.insert(argStore.end(), words.begin(), words.end());
+        std::vector<char*> argvCli;
+        for (size_t i = 0; i < argStore.size(); ++i) {
+            argvCli.push_back(&argStore[i][0]);
+        }
+        argvCli.push_back(NULL);
+
+        try {
+            MoneuCliMain(static_cast<int>(argStore.size()), argvCli.data());
+        } catch (const MoneuCliExit&) {
+        } catch (const std::exception& e) {
+            std::cerr << "error: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "error: the command failed\n";
+        }
+        std::cout.flush();
+        std::cerr.flush();
+    }
+
+    ::WSACleanup();
+    return 0;
+}
+
+}
+#endif
+
 int main(int argc, char* argv[]) {
+#ifdef WIN32
+    ::SetConsoleOutputCP(::GetACP());
+#endif
+#ifdef MONEU_SINGLE_EXE
+    if (argc == 1) return InteractiveMain();
+#endif
     std::vector<std::string> args(argv + 1, argv + argc);
 
     if (HasArg(args, "help") || HasArg(args, "h")) {
@@ -588,7 +1001,7 @@ int main(int argc, char* argv[]) {
 
     if (HasArg(args, "version") || HasArg(args, "v")) {
         std::cout
-            << "MONEU Node v0.2.0\n"
+            << "MONEU Node v0.2.2\n"
             << "Network:   " << NetParams::NETWORK_ID << "\n"
             << "Consensus: Proof-of-Work (SHA-256)\n"
             << "P2P Port:  " << NetParams::DEFAULT_PORT << "\n"
@@ -596,25 +1009,25 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-#ifndef WIN32
     if (HasArg(args, "daemon")) {
         if (!Daemonize()) {
             return 1;
         }
     }
-#endif
 
     std::signal(SIGINT,  SignalHandler);
     std::signal(SIGTERM, SignalHandler);
 #ifndef WIN32
     std::signal(SIGHUP,  SIG_IGN);
     std::signal(SIGPIPE, SIG_IGN);
+#else
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 #endif
 
     MoneuNode node;
 
     try {
-        std::cout << "MONEU Node v0.2.0 starting\n";
+        std::cout << "MONEU Node v0.2.2 starting\n";
 
         std::string dataDirStr = GetArgValue(args, "datadir", "");
         if (!dataDirStr.empty()) {
@@ -672,7 +1085,7 @@ int main(int argc, char* argv[]) {
         InitLogger(*node.dataDir, node.config.GetLog());
         CleanupOldCookie(node.dataDir->GetDataDir());
 
-        LOG_INFO("MONEU Node v0.2.0");
+        LOG_INFO("MONEU Node v0.2.2");
         LOG_INFO("Network:   " + std::string(NetParams::NETWORK_ID));
         LOG_INFO("Consensus: Proof-of-Work (SHA-256)");
         LOG_INFO("DataDir:   " + node.dataDir->GetDataDir().string());
@@ -1007,8 +1420,13 @@ int main(int argc, char* argv[]) {
 
             if (WriteCookieFile(node.dataDir->GetDataDir(), cookie)) {
                 useCookieAuth = true;
+#ifdef WIN32
+                LOG_INFO("RPC: cookie auth - "
+                    "moneu-cli reads %APPDATA%\\MONEU\\.rpc.cookie");
+#else
                 LOG_INFO("RPC: cookie auth - "
                     "moneu-cli reads ~/.moneu/.rpc.cookie");
+#endif
             }
 
             node.rpcServer = std::unique_ptr<rpc::RPCServer>(
@@ -1093,7 +1511,11 @@ int main(int argc, char* argv[]) {
         LOG_INFO("RPC port  : " +
             std::to_string(node.config.GetRPC().rpcPort));
         if (useCookieAuth)
+#ifdef WIN32
+            LOG_INFO("RPC auth  : %APPDATA%\\MONEU\\.rpc.cookie");
+#else
             LOG_INFO("RPC auth  : ~/.moneu/.rpc.cookie");
+#endif
         else
             LOG_INFO("RPC user  : " +
                 node.config.GetRPC().rpcUser);
@@ -1107,12 +1529,10 @@ int main(int argc, char* argv[]) {
         LOG_INFO("To stop   : moneu-cli stop, or Ctrl+C");
         LOG_INFO("========================================");
 
-#ifndef WIN32
         if (gDaemonized) {
             NotifyStartupComplete();
             DetachStandardOutput();
         }
-#endif
 
         auto chainSyncInterval = std::chrono::seconds(5);
         auto lastSync = std::chrono::steady_clock::now();

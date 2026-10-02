@@ -4,7 +4,11 @@
 // Distributed under the MIT software license
 
 #include "miner.h"
+#ifdef WIN32
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 #include "log/log.h"
 #include "validation/block_validation.h"
 #include "storage/chain_state.h"
@@ -192,14 +196,18 @@ Block Miner::BuildBlockTemplate(const bytes32& coinbaseOutputHash)
                 break;
             }
 
-            (void)fee;
+            const uint64_t newTotalFees = totalFees + fee;
+            if (newTotalFees < totalFees) break;
+            totalFees = newTotalFees;
             body.push_back(tx);
         }
     }
 
 
     block.AddTransaction(
-        BuildCoinbase(height, subsidy + totalFees,
+        BuildCoinbase(height,
+                      subsidy + validation::BlockValidation::MinerFeesAtHeight(
+                                    height, totalFees),
                       coinbaseOutputHash, extraNonce));
     for (const auto& tx : body) {
         block.AddTransaction(tx);
@@ -485,7 +493,11 @@ bool Miner::RunNonceLoop(Block& block, int workerId)
 
 void Miner::WorkerLoop(int workerId)
 {
+#ifdef WIN32
+    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#else
     (void)!nice(10);
+#endif
 
     const int loaded = mThreadCount.load();
     const uint32_t threadCount = loaded > 0 ? (uint32_t)loaded : 1;

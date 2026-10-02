@@ -60,6 +60,7 @@ extern const uint32_t  MAX_OP_RETURN_SIZE;
 extern const int64_t   MIN_FEE_PER_BYTE;
 extern const int64_t   MIN_TX_FEE;
 extern const int64_t   DUST_THRESHOLD;
+extern const uint32_t  FEES_TO_MINER_HEIGHT;
 
 static const uint32_t NOISE_LEAF_COUNT_VALUE = 1048576;
 extern const uint32_t  NOISE_LEAF_COUNT;

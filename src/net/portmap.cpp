@@ -12,7 +12,12 @@
 #include <fstream>
 #include <sstream>
 
-#ifndef WIN32
+#ifdef WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <vector>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -103,6 +108,14 @@ bool IsMappedV4(const uint8_t in[16]) {
     return in[10] == 0xFF && in[11] == 0xFF;
 }
 
+#ifdef WIN32
+std::atomic<bool> gWinsockStarted(false);
+
+void ReleaseWinsock() {
+    if (gWinsockStarted.exchange(false)) ::WSACleanup();
+}
+#endif
+
 } // namespace
 
 PortMapper::PortMapper()
@@ -156,6 +169,36 @@ std::string PortMapper::FindDefaultGateway() {
         if (!inet_ntop(AF_INET, &addr, text, sizeof(text))) continue;
         return std::string(text);
     }
+#else
+    ULONG size = 0;
+    if (::GetIpForwardTable(NULL, &size, FALSE) != ERROR_INSUFFICIENT_BUFFER) {
+        return std::string();
+    }
+    std::vector<uint8_t> buffer(size);
+    PMIB_IPFORWARDTABLE table =
+        reinterpret_cast<PMIB_IPFORWARDTABLE>(buffer.data());
+    if (::GetIpForwardTable(table, &size, TRUE) != NO_ERROR) {
+        return std::string();
+    }
+
+    DWORD bestGateway = 0;
+    DWORD bestMetric  = 0xFFFFFFFF;
+    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
+        const MIB_IPFORWARDROW& row = table->table[i];
+        if (row.dwForwardDest != 0 || row.dwForwardMask != 0) continue;
+        if (row.dwForwardNextHop == 0) continue;
+        if (row.dwForwardMetric1 < bestMetric) {
+            bestMetric  = row.dwForwardMetric1;
+            bestGateway = row.dwForwardNextHop;
+        }
+    }
+    if (bestGateway == 0) return std::string();
+
+    struct in_addr addr;
+    addr.s_addr = bestGateway;
+    char text[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &addr, text, sizeof(text))) return std::string();
+    return std::string(text);
 #endif
     return std::string();
 }
@@ -210,9 +253,48 @@ size_t PortMapper::Exchange(const std::string& gateway,
 
     return static_cast<size_t>(got);
 #else
-    (void)gateway; (void)request; (void)requestLen;
-    (void)response; (void)responseCapacity; (void)timeoutMs;
-    return 0;
+    if (gateway.empty() || request == NULL || response == NULL) return 0;
+
+    const SOCKET sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) return 0;
+
+    const DWORD tv = static_cast<DWORD>(timeoutMs);
+    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&tv), sizeof(tv));
+
+    struct sockaddr_in to;
+    std::memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port   = htons(NATPMP_PORT);
+    if (inet_pton(AF_INET, gateway.c_str(), &to.sin_addr) != 1) {
+        ::closesocket(sock);
+        return 0;
+    }
+
+    const int sent = ::sendto(sock, reinterpret_cast<const char*>(request),
+                              static_cast<int>(requestLen), 0,
+                              reinterpret_cast<struct sockaddr*>(&to),
+                              sizeof(to));
+    if (sent != static_cast<int>(requestLen)) {
+        ::closesocket(sock);
+        return 0;
+    }
+
+    struct sockaddr_in from;
+    int fromLen = sizeof(from);
+    std::memset(&from, 0, sizeof(from));
+
+    const int got = ::recvfrom(sock, reinterpret_cast<char*>(response),
+                               static_cast<int>(responseCapacity), 0,
+                               reinterpret_cast<struct sockaddr*>(&from),
+                               &fromLen);
+    ::closesocket(sock);
+
+    if (got <= 0) return 0;
+
+    if (from.sin_addr.s_addr != to.sin_addr.s_addr) return 0;
+
+    return static_cast<size_t>(got);
 #endif
 }
 
@@ -257,15 +339,44 @@ bool PortMapper::FindLocalAddressTowards(const std::string& gateway,
     WriteMappedV4(addrOut, local.sin_addr);
     return true;
 #else
-    (void)gateway; (void)addrOut;
-    return false;
+    if (gateway.empty()) return false;
+
+    const SOCKET sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) return false;
+
+    struct sockaddr_in to;
+    std::memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port   = htons(NATPMP_PORT);
+    if (inet_pton(AF_INET, gateway.c_str(), &to.sin_addr) != 1) {
+        ::closesocket(sock);
+        return false;
+    }
+
+    if (::connect(sock, reinterpret_cast<struct sockaddr*>(&to),
+                  sizeof(to)) != 0) {
+        ::closesocket(sock);
+        return false;
+    }
+
+    struct sockaddr_in local;
+    int localLen = sizeof(local);
+    std::memset(&local, 0, sizeof(local));
+    const int got = ::getsockname(
+        sock, reinterpret_cast<struct sockaddr*>(&local), &localLen);
+    ::closesocket(sock);
+
+    if (got != 0) return false;
+    if (local.sin_addr.s_addr == 0) return false;
+
+    WriteMappedV4(addrOut, local.sin_addr);
+    return true;
 #endif
 }
 
 bool PortMapper::AskExternalAddress(const std::string& gateway,
                                     std::string& addressOut)
 {
-#ifndef WIN32
     // Two bytes: the version and the opcode.
     uint8_t request[2];
     request[0] = NATPMP_VERSION;
@@ -292,9 +403,6 @@ bool PortMapper::AskExternalAddress(const std::string& gateway,
         addressOut = text;
         return true;
     }
-#else
-    (void)gateway; (void)addressOut;
-#endif
     return false;
 }
 
@@ -305,7 +413,6 @@ bool PortMapper::AskMappingPCP(const std::string& gateway,
                                uint16_t& grantedPortOut,
                                std::string& externalAddressOut)
 {
-#ifndef WIN32
     uint8_t client[16];
     if (!FindLocalAddressTowards(gateway, client)) return false;
 
@@ -376,10 +483,6 @@ bool PortMapper::AskMappingPCP(const std::string& gateway,
         }
         return true;
     }
-#else
-    (void)gateway; (void)privatePort; (void)suggestedExternalPort;
-    (void)lifetimeSeconds; (void)grantedPortOut; (void)externalAddressOut;
-#endif
     return false;
 }
 
@@ -389,7 +492,6 @@ bool PortMapper::AskMappingNATPMP(const std::string& gateway,
                                   uint32_t lifetimeSeconds,
                                   uint16_t& grantedPortOut)
 {
-#ifndef WIN32
     // Twelve bytes: version, opcode, two reserved, the port here, the port
     // asked for outside, and how long the mapping should hold.
     uint8_t request[12];
@@ -420,10 +522,6 @@ bool PortMapper::AskMappingNATPMP(const std::string& gateway,
         grantedPortOut = ReadBE16(&response[10]);
         return true;
     }
-#else
-    (void)gateway; (void)privatePort; (void)suggestedExternalPort;
-    (void)lifetimeSeconds; (void)grantedPortOut;
-#endif
     return false;
 }
 
@@ -448,6 +546,14 @@ bool PortMapper::Start(uint16_t privatePort) {
         mGateway.clear();
     }
 
+#ifdef WIN32
+    if (!gWinsockStarted.load()) {
+        WSADATA wsa;
+        if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+        gWinsockStarted = true;
+    }
+#endif
+
     mRunning = true;
     mThread = std::thread(&PortMapper::Loop, this, privatePort);
     return true;
@@ -456,6 +562,9 @@ bool PortMapper::Start(uint16_t privatePort) {
 void PortMapper::Stop() {
     if (!mRunning.load()) {
         if (mThread.joinable()) mThread.join();
+#ifdef WIN32
+        ReleaseWinsock();
+#endif
         return;
     }
 
@@ -467,6 +576,9 @@ void PortMapper::Stop() {
 
     if (mThread.joinable()) mThread.join();
     mRunning = false;
+#ifdef WIN32
+    ReleaseWinsock();
+#endif
 }
 
 void PortMapper::Loop(uint16_t privatePort) {

@@ -1,6 +1,6 @@
 // Copyright (c) 2025-2026 natusor (MONEU)
 // Distributed under the MIT software license
-// Functional test for the noise-OTP single-use enforcement across the state
+// Functional test for the entropy
 // and mempool layers: leaf consumption on apply, rejection of reuse, unmark
 // on undo, persistence through a flush, and the mempool leaf-conflict index.
 
@@ -81,9 +81,6 @@ static Transaction MakeSpendTx(const bytes32& prevTxHash,
     full.AddOutput(TxOutput(value, destPubkeyHash));
     return full;
 }
-
-// Two-block model: a transaction reaches its block carrying no proof at
-// all. The leaves that authorise it are published later, by a reveal.
 
 // Rebind an existing proof's leaf to a different transaction.
 static Transaction RebindLeaf(const Transaction& source,
@@ -373,21 +370,6 @@ int main() {
               "the data carrier cannot be spent");
     }
 
-    // Reveal validation: the rules that decide whether a published set of
-    // leaves may settle a held spend. Stage three of the two-block model.
-
-    // Mempool reveal queue: stage six of the two-block model. Reveals sit
-    // in their own queue, never competing with transactions for space.
-
-    // End to end: the path a real payment takes, from a signed transaction
-    // through to settlement.
-    //
-    // Every layer below was already tested on its own, and every one of
-    // them passed while the whole was broken: validation still demanded a
-    // proof inside the transaction, and the wallet had stopped putting one
-    // there. Each half was correct and they disagreed about the model.
-    // Only a test that crosses the boundary can see that.
-
     // Genesis carries work, and block 1 must end up with strictly more.
     //
     // AcceptBlock treated a genesis parent as carrying no work, so block 1
@@ -420,17 +402,6 @@ int main() {
               "exactly why the tip never moved");
     }
 
-    // A held spend pays no fee until it settles.
-    //
-    // Charging at hold time was an inflation bug. A transaction held in
-    // block N leaves its inputs in the UTXO set and creates no outputs, so
-    // no coins move. If it then expired without a reveal, no coins ever
-    // moved at all - yet the miner of block N had already claimed the fee
-    // in its coinbase. Those units were minted from nothing.
-    //
-    // The fee belongs to whoever settles the spend, and settlement is what
-    // a reveal does.
-
     // Money arithmetic. Every one of these is a way coins could be created
     // from nothing, so each is checked rather than assumed.
     {
@@ -444,9 +415,6 @@ int main() {
               3850000000ULL,
               "the first block of epoch 1 pays half");
 
-        // Emission ends rather than flattening. There is no tail: the
-        // halvings reduce the subsidy to nothing in epoch 33, and from
-        // there a block is paid by the fees of the spends it settles.
         Check(NetParams::GetBlockSubsidy(
                   NetParams::LAST_SUBSIDY_HEIGHT - 1) == 1ULL,
               "the last block with a reward pays one WAGA");
@@ -546,9 +514,6 @@ int main() {
             .Build();
 
         validation::BlockValidationState vs;
-        // The exact cap lives in CheckBlockTransactionsWithUTXO, which has
-        // the UTXO set and so knows the fees this block actually settles.
-        // CheckCoinbaseTransaction is only a loose structural bound.
         Check(!validation::BlockValidation::CheckBlockTransactionsWithUTXO(
                   overpaying, vset, 1, vs),
               "a coinbase paying one unit over the subsidy is refused");

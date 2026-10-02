@@ -16,10 +16,14 @@
 #include <chrono>
 #include <thread>
 
-#ifndef WIN32
+#ifdef WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#endif
 
 namespace {
 
@@ -225,8 +229,6 @@ bool ValidateAndComputeFee(const MONEU::Transaction& tx,
 }
 
 } // namespace
-
-#endif
 
 // Declared in main.cpp - triggers graceful node shutdown
 extern void RequestShutdown();
@@ -789,6 +791,11 @@ private:
         tv.tv_usec = 0;
         setsockopt(mSocket->native_handle(), SOL_SOCKET, SO_SNDTIMEO,
                    &tv, sizeof(tv));
+#else
+        const DWORD tv =
+            static_cast<DWORD>(RPC_CLIENT_TIMEOUT_SEC) * 1000;
+        setsockopt(mSocket->native_handle(), SOL_SOCKET, SO_SNDTIMEO,
+                   reinterpret_cast<const char*>(&tv), sizeof(tv));
 #endif
         asio::write(*mSocket, asio::buffer(payload), ec);
         if (ec) {
@@ -1474,7 +1481,7 @@ void RPCServer::RegisterBuiltinCommands() {
         [](const RPCRequest&,
            const RPCContext& ctx) -> json {
             json result;
-            result["version"]   = "0.2.0";
+            result["version"]   = "0.2.2";
             result["network"]   = NetParams::NETWORK_ID;
             result["useragent"] = NetParams::USER_AGENT;
             // From the running configuration, not the compiled default. A
@@ -1684,11 +1691,6 @@ void RegisterBlockchainRPCCommands(RPCTable& table) {
                     : 0;
                 e["vin"]  = static_cast<uint64_t>(tx.GetInputCount());
                 e["vout"] = static_cast<uint64_t>(tx.GetOutputCount());
-
-                // Whether the leaves that authorise this spend are in the
-                // pool alongside it. A transaction without them cannot be
-                // settled by any block, so this is the first thing to look
-                // at when one will not confirm.
 
                 // Inputs, split by where the output they name lives. One
                 // whose parent is neither in the pool nor on the chain can
@@ -2229,10 +2231,6 @@ void RegisterWalletRPCCommands(RPCTable& table) {
                     moved = ctx.wallet->SyncNoiseLeafPointer(
                         ctx.chainState->GetUTXOSet());
                 }
-                // A transaction held on chain while the wallet was locked
-                // has a window of six blocks and no way of knowing the
-                // wallet came back. Send whatever is already publishable
-                // now rather than wait for the next block to notice.
                 if (moved > 0) {
                     return std::string(
                         "Wallet unlocked and noise file loaded; leaf "
@@ -2621,57 +2619,62 @@ void RegisterWalletRPCCommands(RPCTable& table) {
                     + e.what());
             }
 
-            // The fee the size will demand once the proofs are attached.
-            // Measuring the unsigned transaction would read short by the
-            // proof bytes and leave the fee under the minimum, so the size
-            // is projected from the input count instead.
-            if (!feeExplicit) {
-                const int64_t required =
-                    RequiredFeeForSize(SignedSizeOf(tx));
-                if (required > fee) {
-                    fee = required;
-                    try {
-                        // The first attempt held the outputs it picked;
-                        // release them so the rebuild at the higher fee can
-                        // reach for the same ones.
+            try {
+                // The fee the size will demand once the proofs are attached.
+                // Measuring the unsigned transaction would read short by the
+                // proof bytes and leave the fee under the minimum, so the size
+                // is projected from the input count instead.
+                if (!feeExplicit) {
+                    const int64_t required =
+                        RequiredFeeForSize(SignedSizeOf(tx));
+                    if (required > fee) {
+                        fee = required;
+                        try {
+                            // The first attempt held the outputs it picked;
+                            // release them so the rebuild at the higher fee can
+                            // reach for the same ones.
+                            ctx.wallet->ReleaseOutpointsFor(tx.GetHash());
+                            tx = ctx.wallet->CreateTransaction(
+                                toAddress, amount, fee,
+                                ctx.chainState->GetUTXOSet(),
+                                ctx.chainState->GetHeight(),
+                                &poolTxs, &message);
+                        } catch (const node::WalletError& e) {
+                            throw RPCError(RPC_MISC_ERROR,
+                                std::string("CreateTransaction failed: ")
+                                + e.what());
+                        }
+                    }
+                } else {
+                    const int64_t required =
+                        RequiredFeeForSize(SignedSizeOf(tx));
+                    if (fee < required) {
                         ctx.wallet->ReleaseOutpointsFor(tx.GetHash());
-                        tx = ctx.wallet->CreateTransaction(
-                            toAddress, amount, fee,
-                            ctx.chainState->GetUTXOSet(),
-                            ctx.chainState->GetHeight(),
-                            &poolTxs, &message);
-                    } catch (const node::WalletError& e) {
-                        throw RPCError(RPC_MISC_ERROR,
-                            std::string("CreateTransaction failed: ")
-                            + e.what());
+                        throw RPCError(RPC_INVALID_PARAMS,
+                            "Fee " + std::to_string(fee) +
+                            " is below the minimum " +
+                            std::to_string(required) +
+                            " this transfer requires; omit the fee to have it "
+                            "set from the size");
                     }
                 }
-            } else {
-                const int64_t required =
-                    RequiredFeeForSize(SignedSizeOf(tx));
-                if (fee < required) {
-                    ctx.wallet->ReleaseOutpointsFor(tx.GetHash());
-                    throw RPCError(RPC_INVALID_PARAMS,
-                        "Fee " + std::to_string(fee) +
-                        " is below the minimum " +
-                        std::to_string(required) +
-                        " this transfer requires; omit the fee to have it "
-                        "set from the size");
-                }
+                if (!ctx.wallet->SignTransaction(tx))
+                    throw RPCError(RPC_VERIFY_ERROR,
+                        "Failed to sign transaction "
+                        "(missing key for an input)");
+                int64_t actualFee = 0;
+                std::string reason;
+                if (!ValidateAndComputeFee(tx, ctx, actualFee, reason))
+                    throw RPCError(RPC_VERIFY_REJECTED,
+                        "Transaction invalid: " + reason);
+                if (!ctx.mempool->AddTransaction(tx, actualFee))
+                    throw RPCError(RPC_VERIFY_REJECTED,
+                        "Transaction rejected by mempool (duplicate, "
+                        "conflict, or fee rate below the rolling minimum)");
+            } catch (...) {
+                ctx.wallet->ReleaseOutpointsOf(tx);
+                throw;
             }
-            if (!ctx.wallet->SignTransaction(tx))
-                throw RPCError(RPC_VERIFY_ERROR,
-                    "Failed to sign transaction "
-                    "(missing key for an input)");
-            int64_t actualFee = 0;
-            std::string reason;
-            if (!ValidateAndComputeFee(tx, ctx, actualFee, reason))
-                throw RPCError(RPC_VERIFY_REJECTED,
-                    "Transaction invalid: " + reason);
-            if (!ctx.mempool->AddTransaction(tx, actualFee))
-                throw RPCError(RPC_VERIFY_REJECTED,
-                    "Transaction rejected by mempool (duplicate, "
-                    "conflict, or fee rate below the rolling minimum)");
             if (ctx.connManager)
                 ctx.connManager->BroadcastTransaction(tx);
             std::ostringstream oss;
@@ -2855,12 +2858,6 @@ void RegisterMiningRPCCommands(RPCTable& table) {
         "by external mining software",
         [](const RPCRequest& req,
            const RPCContext& ctx) -> json {
-            // The node assembles the template; the caller only searches for
-            // a nonce. Which transactions go in, what the coinbase may pay
-            // and how the reveals are ordered are consensus matters, and a
-            // node that let the caller decide them would be trusting
-            // software on the far end of a socket not to produce a block
-            // its own rules reject.
             if (!ctx.miner || !ctx.chainState)
                 throw RPCError(RPC_INTERNAL_ERROR,
                     "Mining not available");

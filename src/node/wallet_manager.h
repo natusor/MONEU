@@ -135,19 +135,6 @@ private:
     // Key for the map above: the 32-byte hash followed by the index.
     static std::string OutpointKey(const bytes32& txid, uint32_t index);
 
-    // Proofs made for a transaction that has been signed but whose leaves
-    // are not published yet.
-    //
-    // In the two-block model a transaction reaches its block carrying no
-    // proof; the leaves follow in a later block. The wallet therefore has
-    // to hold the proofs from the moment it signs until the transaction is
-    // seen in a block, and then hand them over as a reveal.
-    //
-    // They are written to the wallet file, not merely kept in memory. The
-    // window is six blocks, about an hour, and a node restarted inside it
-    // would otherwise lose the proofs - the leaves would already be
-    // consumed, so they could not be made again, and the payment would sit
-    // held until it expired.
     // On-disk format version. Version 2 carries the AES-CBC IV and holds
     // an AES-encrypted entropy field; version 1 files are not readable.
     // Version 4 stores proofs prepared for transactions awaiting their
@@ -286,6 +273,7 @@ public:
     // marked spent, whatever any wallet believes. This only keeps the
     // wallet from building a transfer that was going to be thrown away.
     void ReleaseOutpointsFor(const bytes32& txid);
+    void ReleaseOutpointsOf(const Transaction& tx);
     size_t HeldOutpointCount() const;
 
     // Whether this output can be spent at the given chain height.
@@ -324,8 +312,6 @@ public:
     // Returns the number of leaves the pointer moved forward.
     uint32_t SyncNoiseLeafPointer(const storage::UTXOSet& utxoSet);
 
-    // Assemble the reveal for a transaction now known to sit at height.
-    // False when nothing was prepared for it.
     bool IsNoiseLoaded() const { return mNoiseLoaded; }
     const bytes32& GetNoiseKps() const;
     uint32_t GetNoiseRemaining() const;

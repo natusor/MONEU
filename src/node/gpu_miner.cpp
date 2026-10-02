@@ -3,7 +3,29 @@
 
 #include "gpu_miner.h"
 
+#ifdef WIN32
+#include <windows.h>
+
+#undef LoadLibrary
+
+namespace {
+const int RTLD_NOW   = 0;
+const int RTLD_LOCAL = 0;
+
+void* dlopen(const char* name, int) {
+    return reinterpret_cast<void*>(::LoadLibraryA(name));
+}
+void* dlsym(void* lib, const char* name) {
+    return reinterpret_cast<void*>(
+        ::GetProcAddress(reinterpret_cast<HMODULE>(lib), name));
+}
+int dlclose(void* lib) {
+    return ::FreeLibrary(reinterpret_cast<HMODULE>(lib)) ? 0 : 1;
+}
+} // namespace
+#else
 #include <dlfcn.h>
+#endif
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -104,8 +126,12 @@ GpuMiner::~GpuMiner() {
 
 bool GpuMiner::LoadLibrary(std::string& reasonOut) {
     if (mLib) return true;
+#ifdef WIN32
+    mLib = dlopen("OpenCL.dll", RTLD_NOW | RTLD_LOCAL);
+#else
     mLib = dlopen("libOpenCL.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!mLib) mLib = dlopen("libOpenCL.so", RTLD_NOW | RTLD_LOCAL);
+#endif
     if (!mLib) {
         reasonOut = "OpenCL library not installed";
         return false;

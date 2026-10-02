@@ -107,6 +107,8 @@ public:
         const Block& block,
         BlockValidationState& state);
 
+    static uint64_t MinerFeesAtHeight(uint32_t height, uint64_t blockFees);
+
     static std::string ResultToString(BlockValidationResult result);
 };
 

@@ -10,12 +10,23 @@
 #include <cstdlib>
 #include <cerrno>
 
+#ifdef WIN32
+#undef NOGDI
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <shlobj.h>
+#include <direct.h>
+#include <sys/stat.h>
+#define close closesocket
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pwd.h>
 #include <sys/stat.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -24,6 +35,11 @@
 #include "wallet/noise_store.h"
 #include "primitives/keys.h"
 #include "chainparams.h"
+
+#ifdef MONEU_SINGLE_EXE
+#include "app/cli_exit.h"
+#define exit(code) throw MoneuCliExit{code}
+#endif
 
 using json = nlohmann::json;
 
@@ -124,6 +140,13 @@ static bool ReadCookieFile(
 
 static std::string GetDefaultDataDir() {
     if (!gDataDir.empty()) return gDataDir;
+#ifdef WIN32
+    char path[MAX_PATH];
+    if (SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path) == S_OK) {
+        return std::string(path) + "\\MONEU";
+    }
+    return std::string("C:\\MONEU");
+#else
     const char* home = getenv("HOME");
     if (!home) {
         struct passwd* pw = getpwuid(getuid());
@@ -131,6 +154,7 @@ static std::string GetDefaultDataDir() {
     }
     if (!home) return "";
     return std::string(home) + "/.moneu";
+#endif
 }
 
 static std::string SendRPCRequest(
@@ -145,6 +169,13 @@ static std::string SendRPCRequest(
     // Bitcoin's -rpcclienttimeout default. Ten seconds was enough for an
     // idle node and not for a busy one: the client gave up while the node
     // was still working and called the reply unreadable.
+#ifdef WIN32
+    const DWORD tv = static_cast<DWORD>(gRPCClientTimeout) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&tv), sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&tv), sizeof(tv));
+#else
     struct timeval tv;
     tv.tv_sec  = gRPCClientTimeout;
     tv.tv_usec = 0;
@@ -152,6 +183,7 @@ static std::string SendRPCRequest(
                &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
                &tv, sizeof(tv));
+#endif
 
     struct sockaddr_in server;
     memset(&server, 0, sizeof(server));
@@ -435,7 +467,11 @@ static bool EnsureDir(const std::string& path) {
     if (stat(path.c_str(), &st) == 0) {
         return (st.st_mode & S_IFDIR) != 0;
     }
+#ifdef WIN32
+    return _mkdir(path.c_str()) == 0;
+#else
     return mkdir(path.c_str(), 0700) == 0;
+#endif
 }
 
 static int HandleMakeNoise(const std::string& passphrase) {
@@ -547,6 +583,14 @@ static bool IsTextArgument(const std::string& command, size_t pos) {
 }
 
 int main(int argc, char* argv[]) {
+#if defined(WIN32) && !defined(MONEU_SINGLE_EXE)
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        std::cerr << "error: cannot start Windows sockets\n";
+        return 1;
+    }
+    atexit([]() { WSACleanup(); });
+#endif
     std::vector<std::string> args(
         argv + 1, argv + argc);
 

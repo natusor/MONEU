@@ -2,9 +2,15 @@
 // Distributed under the MIT software license
 
 #include "net.h"
+#ifdef WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#else
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netdb.h>
+#endif
 #include <map>
 #include <set>
 #include <cstdio>
@@ -590,8 +596,15 @@ bool ConnManager::ConnectToAddress(const NetAddress& addr) {
             if (rc == 0) {
                 ec = boost::system::error_code();
             } else {
+#ifdef WIN32
+                const int wsaErr = ::WSAGetLastError();
+                ec = boost::system::error_code(
+                    wsaErr == WSAEWOULDBLOCK ? EINPROGRESS : wsaErr,
+                    boost::system::system_category());
+#else
                 ec = boost::system::error_code(
                     errno, boost::system::system_category());
+#endif
             }
         }
 
@@ -610,8 +623,15 @@ bool ConnManager::ConnectToAddress(const NetAddress& addr) {
                 FD_ZERO(&wfds);
                 FD_SET(node->socket.native_handle(), &wfds);
                 struct timeval tv = {0, 500000};  // 500ms
+#ifdef WIN32
+                fd_set efds;
+                FD_ZERO(&efds);
+                FD_SET(node->socket.native_handle(), &efds);
+                int sel = select(0, nullptr, &wfds, &efds, &tv);
+#else
                 int sel = select(node->socket.native_handle() + 1,
                                  nullptr, &wfds, nullptr, &tv);
+#endif
                 if (sel > 0) {
                     boost::system::error_code ec2;
                     node->socket.non_blocking(false, ec2);
@@ -623,6 +643,11 @@ bool ConnManager::ConnectToAddress(const NetAddress& addr) {
                     if (err == 0) {
                         connected = true;
                     }
+#ifdef WIN32
+                    else {
+                        break;
+                    }
+#endif
                 } else if (sel == 0) {
                 } else {
                     break;
@@ -978,6 +1003,7 @@ void ConnManager::HandleGetAddr(NodePtr node) {
 void ConnManager::HandleInv(
     NodePtr node, const NetMessage& msg)
 {
+    if (!node->connected) return;
     if (msg.payload.size() < 4) {
         node->AddMisbehavior(5);
         return;
@@ -1001,6 +1027,11 @@ void ConnManager::HandleInv(
     }
     size_t offset = 4;
     std::vector<InvItem> getDataItems;
+    size_t blocksFromThisPeer = 0;
+    {
+        std::lock_guard<std::mutex> lock(mInFlightMutex);
+        blocksFromThisPeer = CountBlocksInFlightLocked(node->id);
+    }
     for (uint32_t i = 0; i < count; ++i) {
         if (offset + 1 + 32 > msg.payload.size())
             break;
@@ -1016,10 +1047,12 @@ void ConnManager::HandleInv(
             if (!ShouldRequestTx(item.hash, node->id)) continue;
             getDataItems.push_back(item);
         } else if (item.type == InvType::BLOCK) {
+            if (blocksFromThisPeer >= MAX_BLOCKS_IN_FLIGHT_PER_PEER) continue;
             if (mCallbacks.haveBlock && mCallbacks.haveBlock(item.hash)) {
                 continue;
             }
             if (!ShouldRequestBlock(item.hash, node->id)) continue;
+            ++blocksFromThisPeer;
             getDataItems.push_back(item);
         }
     }
@@ -1105,6 +1138,11 @@ void ConnManager::HandleBlock(
 
         node->lastNovelBlock = GetCurrentTimestamp();
 
+        const bytes32 parentHash = block.GetHeader().GetPrevBlockHash();
+        if (mCallbacks.haveBlock && !mCallbacks.haveBlock(parentHash)) {
+            ReRequestStalledParent(node, parentHash);
+        }
+
         if (mCallbacks.onBlock)
             mCallbacks.onBlock(node->id, block);
     } catch (const std::exception& e) {
@@ -1114,6 +1152,33 @@ void ConnManager::HandleBlock(
                   << ": " << e.what() << "\n";
         node->AddMisbehavior(20);
     }
+}
+
+void ConnManager::ReRequestStalledParent(NodePtr node,
+                                         const bytes32& parentHash)
+{
+    const std::string parentKey(
+        reinterpret_cast<const char*>(parentHash.data()), 32);
+    const int64_t now = GetCurrentTimestamp();
+    {
+        std::lock_guard<std::mutex> lock(mInFlightMutex);
+        auto it = mBlocksInFlight.find(parentKey);
+        if (it == mBlocksInFlight.end()) return;
+        if (it->second.peer == node->id) return;
+        if (now - it->second.requestedAt < BLOCK_PARENT_REREQUEST_SEC) return;
+        it->second.peer = node->id;
+        it->second.requestedAt = now;
+    }
+    std::vector<uint8_t> payload;
+    payload.push_back(1);
+    payload.push_back(0);
+    payload.push_back(0);
+    payload.push_back(0);
+    payload.push_back(static_cast<uint8_t>(InvType::BLOCK));
+    payload.insert(payload.end(), parentHash.begin(), parentHash.end());
+    node->PushMessage(NetMessage(MsgType::GETDATA, payload));
+    MONEU_LOG_DEBUG("Parent block re-requested from peer=" +
+                    std::to_string(node->id));
 }
 
 void ConnManager::HandleReject(
@@ -1209,6 +1274,11 @@ void ConnManager::HandleGetBlocks(NodePtr node, const NetMessage& msg) {
 }
 
 void ConnManager::RequestBlocksFrom(NodeId nodeId) {
+    {
+        std::lock_guard<std::mutex> lock(mInFlightMutex);
+        if (CountBlocksInFlightLocked(nodeId) >
+            MAX_BLOCKS_IN_FLIGHT_PER_PEER / 2) return;
+    }
     NodePtr node;
     {
         std::lock_guard<std::mutex> lock(mNodesMutex);
@@ -1234,8 +1304,12 @@ void ConnManager::RequestBlocksFrom(NodeId nodeId) {
     node->PushMessage(NetMessage(MsgType::GETBLOCKS, payload));
 }
 
-namespace {
-const int64_t BLOCK_IN_FLIGHT_TIMEOUT_SEC = 1800;
+size_t ConnManager::CountBlocksInFlightLocked(NodeId peer) const {
+    size_t count = 0;
+    for (const auto& entry : mBlocksInFlight) {
+        if (entry.second.peer == peer) ++count;
+    }
+    return count;
 }
 
 bool ConnManager::ShouldRequestBlock(const bytes32& hash, NodeId from) {
@@ -1256,11 +1330,9 @@ bool ConnManager::ShouldRequestBlock(const bytes32& hash, NodeId from) {
 
     if (mBlocksInFlight.size() >= BLOCK_DOWNLOAD_WINDOW) return false;
 
-    size_t fromThisPeer = 0;
-    for (const auto& entry : mBlocksInFlight) {
-        if (entry.second.peer == from) fromThisPeer++;
+    if (CountBlocksInFlightLocked(from) >= MAX_BLOCKS_IN_FLIGHT_PER_PEER) {
+        return false;
     }
-    if (fromThisPeer >= MAX_BLOCKS_IN_FLIGHT_PER_PEER) return false;
 
     InFlightEntry e;
     e.peer = from;
@@ -1552,7 +1624,7 @@ void ConnManager::CheckDownloadProgress() {
                     ++it;
                 }
             }
-            if (now - mStallingSince[blocker] > BLOCK_STALL_TIMEOUT_SEC) {
+            if (now - oldest > BLOCK_STALL_TIMEOUT_SEC) {
                 toDrop.push_back(std::make_pair(
                     blocker, std::string("stalling the block download")));
             }
@@ -1589,8 +1661,15 @@ void ConnManager::CheckDownloadProgress() {
         {
             std::lock_guard<std::mutex> lock(mNodesMutex);
             auto it = mNodes.find(toDrop[i].first);
-            if (it == mNodes.end() || !it->second) continue;
-            node = it->second;
+            if (it != mNodes.end() && it->second) node = it->second;
+        }
+        if (!node) {
+            MONEU_LOG_INFO("Peer=" + std::to_string(toDrop[i].first) +
+                           " is gone, its block requests go to other peers");
+            ClearInFlightForPeer(toDrop[i].first);
+            std::lock_guard<std::mutex> lock(mInFlightMutex);
+            mStallingSince.erase(toDrop[i].first);
+            continue;
         }
         MONEU_LOG_INFO("Peer=" + std::to_string(toDrop[i].first) + " " +
                        toDrop[i].second + ", disconnecting - its blocks go "
@@ -1935,6 +2014,65 @@ void ConnManager::DiscoverLocalAddresses() {
         if (!mExternalAddress.ip.empty()) found.push_back(mExternalAddress);
     }
 
+#ifdef WIN32
+    ULONG bufLen = 16 * 1024;
+    std::vector<uint8_t> buf;
+    ULONG rc = ERROR_BUFFER_OVERFLOW;
+    for (int attempt = 0; attempt < 4 && rc == ERROR_BUFFER_OVERFLOW; ++attempt) {
+        buf.resize(bufLen);
+        rc = ::GetAdaptersAddresses(
+            AF_UNSPEC,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_FRIENDLY_NAME,
+            NULL,
+            reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data()),
+            &bufLen);
+    }
+    if (rc == NO_ERROR) {
+        for (PIP_ADAPTER_ADDRESSES ad =
+                 reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buf.data());
+             ad != NULL; ad = ad->Next) {
+            if (ad->OperStatus != IfOperStatusUp) continue;
+            if (ad->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+
+            for (PIP_ADAPTER_UNICAST_ADDRESS ua = ad->FirstUnicastAddress;
+                 ua != NULL; ua = ua->Next) {
+                const struct sockaddr* sa = ua->Address.lpSockaddr;
+                if (sa == NULL) continue;
+
+                socklen_t saLen = 0;
+                if (sa->sa_family == AF_INET) {
+                    saLen = sizeof(struct sockaddr_in);
+                } else if (sa->sa_family == AF_INET6) {
+                    saLen = sizeof(struct sockaddr_in6);
+                } else {
+                    continue;
+                }
+
+                char host[NI_MAXHOST];
+                if (::getnameinfo(sa, saLen, host, NI_MAXHOST, NULL, 0,
+                                  NI_NUMERICHOST) != 0) {
+                    continue;
+                }
+                char* pct = std::strchr(host, '%');
+                if (pct) *pct = '\0';
+
+                const std::string ip(host);
+                if (!IsRelayableAddress(ip)) continue;
+
+                bool already = false;
+                for (size_t i = 0; i < found.size(); ++i) {
+                    if (found[i].ip == ip) { already = true; break; }
+                }
+                if (already) continue;
+
+                NetAddress a(ip, mOptions.listenPort);
+                a.lastSeen = static_cast<uint64_t>(GetCurrentTimestamp());
+                found.push_back(a);
+            }
+        }
+    }
+#else
     struct ifaddrs* addrs = NULL;
     if (getifaddrs(&addrs) == 0) {
         for (struct ifaddrs* ifa = addrs; ifa != NULL; ifa = ifa->ifa_next) {
@@ -1975,6 +2113,7 @@ void ConnManager::DiscoverLocalAddresses() {
         }
         freeifaddrs(addrs);
     }
+#endif
 
     {
         std::lock_guard<std::mutex> lock(mLocalAddrMutex);

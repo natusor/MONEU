@@ -46,7 +46,7 @@ Boost 1.74 or newer is required, so it will not build on older systems.
 apt install -y build-essential cmake \
     libboost-filesystem-dev libboost-system-dev \
     libboost-thread-dev libboost-program-options-dev \
-    libssl-dev libleveldb-dev nlohmann-json3-dev
+    libssl-dev nlohmann-json3-dev
 ```
 
 If an old build directory is left over from a previous attempt, remove it
@@ -54,6 +54,19 @@ first. CMake keeps old paths in its cache and the build will fail with a
 confusing error.
 
 See [BUILD.md](BUILD.md) for more detail.
+
+## Windows
+
+Windows 10 or 11, 64-bit.
+
+Unpack `moneu-0.2.2-windows-x86_64.zip` and run `moneu.exe`.
+It checks the computer, starts the node in the background and opens a
+`moneu>` prompt. The commands are the same as `moneu-cli` on Linux,
+without `moneu-cli` in front.
+
+Data is kept in `%APPDATA%\MONEU`.
+
+To build it yourself, see [BUILD.md](BUILD.md).
 
 ## After the first start
 
@@ -72,6 +85,19 @@ separate drives and encrypt them.
 Losing the entropy file means losing access to the coins even with the recovery words.
 
 Do not create two different wallets on the same machine.
+
+## Checking the balance
+
+```
+./build/src/moneu-cli getwalletinfo
+./build/src/moneu-cli listaddresses
+./build/src/moneu-cli getbalance "address"
+```
+
+`getwalletinfo` shows the balance of the whole wallet.
+`listaddresses` lists its addresses.
+`getbalance` shows the balance of any single address, split into what can
+be spent now and what is still waiting to mature.
 
 ## Documentation
 

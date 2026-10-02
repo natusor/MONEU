@@ -32,7 +32,11 @@ std::string HexOf(const bytes32& h) {
 std::string TimeOf(uint64_t unixTime) {
     const std::time_t t = static_cast<std::time_t>(unixTime);
     std::tm tmUtc;
+#ifdef WIN32
+    gmtime_s(&tmUtc, &t);
+#else
     gmtime_r(&t, &tmUtc);
+#endif
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
     return std::string(buf);

@@ -45,7 +45,11 @@ std::string Timestamp() {
     // UTC, like block timestamps. Nodes in different time zones otherwise
     // produce logs that cannot be lined up without knowing where each one
     // was running.
+#ifdef WIN32
+    gmtime_s(&tmLocal, &now);
+#else
     gmtime_r(&now, &tmLocal);
+#endif
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tmLocal);
     return std::string(buf);

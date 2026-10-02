@@ -4,7 +4,12 @@
 #include "block_data.h"
 
 #include <fcntl.h>
+#ifdef WIN32
+#include <io.h>
+#define fsync _commit
+#else
 #include <unistd.h>
+#endif
 #include <cerrno>
 #include <cstring>
 #include <iostream>
@@ -70,8 +75,13 @@ bool BlockData::WriteBlockToDisk(const Block& block, DiskBlockPos& pos) {
         filePath = GetBlockFilePath(mLastBlockFile);
         currentSize = 0;
     }
+#ifdef WIN32
+    const int fd = ::open(filePath.string().c_str(),
+                          O_WRONLY | O_CREAT | O_APPEND | O_BINARY, 0644);
+#else
     const int fd = ::open(filePath.string().c_str(),
                           O_WRONLY | O_CREAT | O_APPEND, 0644);
+#endif
     if (fd < 0) {
         throw DBError("Failed to open block file: " + filePath.string());
     }

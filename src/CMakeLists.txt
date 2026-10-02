@@ -1,3 +1,9 @@
+if(WIN32)
+    set(PLATFORM_LIBRARIES ws2_32 mswsock iphlpapi bcrypt)
+else()
+    set(PLATFORM_LIBRARIES "")
+endif()
+
 add_subdirectory(log)
 add_subdirectory(util)
 add_subdirectory(crypto)
@@ -9,10 +15,6 @@ add_subdirectory(validation)
 add_subdirectory(net)
 add_subdirectory(rpc)
 add_subdirectory(node)
-# Network constants (NetParams). Several libraries reference these, so
-# chainparams must be a library of its own rather than a source compiled
-# into one executable. The file stays at src/chainparams.cpp so it can be
-# swapped for the genesis-mining variant without touching the build.
 add_library(moneu_chainparams STATIC
     chainparams.cpp
 )
@@ -46,6 +48,7 @@ target_link_libraries(moneud
     -Wl,--end-group
     ${Boost_LIBRARIES}
     ${OPENSSL_LIBRARIES}
+    ${PLATFORM_LIBRARIES}
     Threads::Threads
     ${CMAKE_DL_LIBS}
 )
@@ -68,12 +71,10 @@ target_link_libraries(moneu-cli
     -Wl,--end-group
     ${Boost_LIBRARIES}
     ${OPENSSL_LIBRARIES}
+    ${PLATFORM_LIBRARIES}
     Threads::Threads
 )
 
-# Self-test for the anti-quantum noise shield: proof creation, binding to a
-# transaction hash, rejection of a rebound or replayed proof, and pool
-# exhaustion. Built as its own executable so it can be run directly.
 add_executable(moneu-test-noise
     test_noise_shield.cpp
 )
@@ -90,11 +91,51 @@ target_link_libraries(moneu-test-noise
     moneu_chainparams
     moneu_consensus
     moneu_crypto
+    moneu_net
+    moneu_util
     ${LEVELDB_LIBRARY}
     -Wl,--end-group
     ${Boost_LIBRARIES}
     ${OPENSSL_LIBRARIES}
+    ${PLATFORM_LIBRARIES}
     Threads::Threads
-    moneu_net
-    moneu_util
 )
+
+if(WIN32)
+    enable_language(RC)
+    add_executable(moneu
+        main.cpp
+        miner.cpp
+        node/gpu_miner.cpp
+        app/cli_embed.cpp
+        app/test_embed.cpp
+        app/moneu.rc
+    )
+    target_compile_definitions(moneu PRIVATE MONEU_SINGLE_EXE)
+    target_include_directories(moneu PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/crypto
+        ${CMAKE_SOURCE_DIR}/src/app
+    )
+    target_link_libraries(moneu
+        -Wl,--start-group
+        moneu_rpc
+        moneu_node
+        moneu_net
+        moneu_validation
+        moneu_storage
+        moneu_consensus
+        moneu_primitives
+        moneu_wallet
+        moneu_crypto
+        moneu_chainparams
+        moneu_util
+        ${LEVELDB_LIBRARY}
+        -Wl,--end-group
+        ${Boost_LIBRARIES}
+        ${OPENSSL_LIBRARIES}
+        ${PLATFORM_LIBRARIES}
+        Threads::Threads
+        ${CMAKE_DL_LIBS}
+    )
+endif()

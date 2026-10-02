@@ -57,11 +57,9 @@ public:
 };
 
 static void SetMaxOpenFiles(leveldb::Options* options) {
-#ifndef WIN32
     if (sizeof(void*) < 8) {
         options->max_open_files = 64;
     }
-#endif
 }
 
 static leveldb::Options GetOptions(size_t nCacheSize) {

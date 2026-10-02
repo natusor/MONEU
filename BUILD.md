@@ -7,10 +7,12 @@ Ubuntu 24.04 / Debian:
     apt-get install -y build-essential cmake \
         libboost-filesystem-dev libboost-system-dev \
         libboost-thread-dev libboost-program-options-dev \
-        libssl-dev libleveldb-dev nlohmann-json3-dev
+        libssl-dev nlohmann-json3-dev
 
 `nlohmann-json3-dev` is required by `src/rpc` and `libssl-dev` by
 `src/crypto/secure_enc.cpp` (AES-256-CBC).
+
+LevelDB is built from `src/leveldb`, so no system package is needed for it.
 
 ## Build
 
@@ -73,5 +75,25 @@ Mining is built in so No separate software is needed.
 Write down the recovery phrase `createwallet` prints and keep a copy of the wallet directory. 
 Both the wallet file and the noise file are needed to spend neither is enough on its own.
 
+## Windows
 
+The Windows build is made on Ubuntu with the mingw-w64 compiler.
 
+    apt-get install -y g++-mingw-w64-x86-64-posix curl
+
+Build the libraries for Windows once. Boost, OpenSSL and nlohmann_json
+are downloaded, checked against the hashes in `depends/packages/*.mk`
+and built into `depends/x86_64-w64-mingw32`:
+
+    make -C depends HOST=x86_64-w64-mingw32 -j$(nproc)
+
+Then the node:
+
+    rm -rf build-win
+    cmake -S . -B build-win -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=depends/x86_64-w64-mingw32/toolchain.cmake \
+          -DSTATIC_DEPS=ON
+    cmake --build build-win -j$(nproc)
+
+Produces `moneu.exe`, `moneud.exe`, `moneu-cli.exe` and `moneu-test-noise.exe`
+in `build-win/src`. `moneu.exe` alone is enough to run a node.

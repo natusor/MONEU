@@ -300,10 +300,18 @@ bool BlockValidation::CheckBlockTransactionsWithUTXO(
                 " outputs exceed inputs");
             return false;
         }
+        const uint64_t newTotalFees = totalFees + (txIn - txOut);
+        if (newTotalFees < totalFees) {
+            state.SetInvalid(
+                BlockValidationResult::INVALID_TRANSACTION,
+                "Accumulated block fees out of range");
+            return false;
+        }
+        totalFees = newTotalFees;
     }
 
     const uint64_t subsidy = NetParams::GetBlockSubsidy(currentHeight);
-    uint64_t allowed = subsidy + totalFees;
+    uint64_t allowed = subsidy + MinerFeesAtHeight(currentHeight, totalFees);
     if (allowed < subsidy) {
         state.SetInvalid(
             BlockValidationResult::INVALID_COINBASE,
@@ -410,6 +418,13 @@ bool BlockValidation::CheckGenesisBlock(
         return false;
     }
     return true;
+}
+
+uint64_t BlockValidation::MinerFeesAtHeight(uint32_t height,
+                                            uint64_t blockFees)
+{
+    if (height < NetParams::FEES_TO_MINER_HEIGHT) return 0;
+    return blockFees;
 }
 
 std::string BlockValidation::ResultToString(

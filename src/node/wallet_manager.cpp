@@ -16,6 +16,10 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <io.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #endif
 
 extern "C" {
@@ -571,6 +575,14 @@ void WalletManager::ReleaseOutpointsFor(const bytes32& txid) {
     }
 }
 
+void WalletManager::ReleaseOutpointsOf(const Transaction& tx) {
+    std::lock_guard<std::mutex> lock(mMutex);
+    for (size_t i = 0; i < tx.GetInputCount(); ++i) {
+        mHeldOutpoints.erase(OutpointKey(tx.GetInputs()[i].GetPrevTxHash(),
+                                         tx.GetInputs()[i].GetOutputIndex()));
+    }
+}
+
 size_t WalletManager::HeldOutpointCount() const {
     std::lock_guard<std::mutex> lock(mMutex);
     return mHeldOutpoints.size();
@@ -651,21 +663,8 @@ Transaction WalletManager::CreateTransaction(
         mine.insert(a.pubkeyHash);
     }
 
-    auto utxos = utxoSet.GetUTXOsForAddresses(mine);
-    for (auto& u : utxos) {
-        if (!IsSpendableNow(u.second, chainHeight)) {
-            immatureHeld += u.second.value;
-            continue;
-        }
-        if (mHeldOutpoints.count(
-                OutpointKey(u.first.txHash, u.first.index)) > 0) {
-            continue;
-        }
-        spendable.push_back(u);
-    }
-
+    std::set<std::string> spentInPool;
     if (poolTxs != NULL) {
-        std::set<std::string> spentInPool;
         for (size_t t = 0; t < poolTxs->size(); ++t) {
             const Transaction& p = (*poolTxs)[t];
             for (size_t i = 0; i < p.GetInputCount(); ++i) {
@@ -674,7 +673,22 @@ Transaction WalletManager::CreateTransaction(
                     p.GetInputs()[i].GetOutputIndex()));
             }
         }
+    }
 
+    auto utxos = utxoSet.GetUTXOsForAddresses(mine);
+    for (auto& u : utxos) {
+        if (!IsSpendableNow(u.second, chainHeight)) {
+            immatureHeld += u.second.value;
+            continue;
+        }
+        const std::string key = OutpointKey(u.first.txHash, u.first.index);
+        if (mHeldOutpoints.count(key) > 0) continue;
+        if (spentInPool.count(key) > 0) continue;
+        spendable.push_back(u);
+    }
+
+    int64_t pendingChange = 0;
+    if (poolTxs != NULL) {
         for (size_t t = 0; t < poolTxs->size(); ++t) {
             const Transaction& p = (*poolTxs)[t];
             const bytes32 ptxid = p.GetHash();
@@ -695,14 +709,7 @@ Transaction WalletManager::CreateTransaction(
                 if (spentInPool.count(key) > 0)   continue;
                 if (mHeldOutpoints.count(key) > 0) continue;
 
-                storage::Coin coin;
-                coin.value      = out.GetValue();
-                coin.pubkeyHash = out.GetPubkeyHash();
-                coin.height     = chainHeight;
-                coin.isCoinbase = false;
-                coin.isSpent    = false;
-                spendable.push_back(std::make_pair(
-                    storage::OutPoint(ptxid, static_cast<uint32_t>(o)), coin));
+                pendingChange += out.GetValue();
             }
         }
     }
@@ -719,6 +726,17 @@ Transaction WalletManager::CreateTransaction(
     }
 
     if (collected < needed) {
+        if (pendingChange > 0 && collected + pendingChange >= needed) {
+            char pendingText[48];
+            std::snprintf(pendingText, sizeof(pendingText), "%lld.%08lld",
+                          static_cast<long long>(pendingChange / NetParams::COIN),
+                          static_cast<long long>(pendingChange % NetParams::COIN));
+            throw WalletError(
+                std::string("Insufficient confirmed funds. ") + pendingText +
+                " MONEU is change from an earlier transfer that is not "
+                "confirmed yet. It becomes spendable once that transfer "
+                "is in a block, usually within 10 minutes");
+        }
         if (immatureHeld > 0) {
             throw WalletError(
                 "Insufficient funds. " +
@@ -1148,24 +1166,34 @@ bool WalletManager::SaveToFile() const {
         return false;
     }
 #else
-    {
-        std::ofstream file(tmpFile,
-            std::ios::binary | std::ios::trunc);
-        if (!file.is_open()) {
-            std::cerr << "WalletManager: cannot open "
-                         "tmp wallet file\n";
-            return false;
+    ::_unlink(tmpFile.c_str());
+    int fd = ::_open(tmpFile.c_str(),
+                     _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                     _S_IREAD | _S_IWRITE);
+    if (fd < 0) {
+        std::cerr << "WalletManager: cannot create tmp wallet file\n";
+        return false;
+    }
+    size_t off = 0;
+    bool ok = true;
+    while (off < buf.size()) {
+        const size_t left = buf.size() - off;
+        const unsigned int want = left > 0x40000000u
+            ? 0x40000000u : static_cast<unsigned int>(left);
+        int n = ::_write(fd, buf.data() + off, want);
+        if (n <= 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
         }
-        file.write(reinterpret_cast<const char*>(buf.data()),
-                   static_cast<std::streamsize>(buf.size()));
-        if (!file.good()) {
-            std::cerr << "WalletManager: error writing "
-                         "tmp wallet\n";
-            file.close();
-            fs::remove(tmpFile);
-            return false;
-        }
-        file.flush();
+        off += static_cast<size_t>(n);
+    }
+    if (ok && ::_commit(fd) != 0) ok = false;
+    if (::_close(fd) != 0) ok = false;
+    if (!ok) {
+        std::cerr << "WalletManager: error writing tmp wallet\n";
+        ::_unlink(tmpFile.c_str());
+        return false;
     }
 #endif
 

@@ -5,7 +5,12 @@
 #include <iterator>
 #include <fstream>
 #include <cerrno>
+#ifdef WIN32
+#include <io.h>
+#define fsync _commit
+#else
 #include <unistd.h>
+#endif
 #include <fcntl.h>
 #include <set>
 #include <cstdint>
@@ -200,8 +205,13 @@ bool Mempool::Save(const boost::filesystem::path& path) const {
     }
 
     const boost::filesystem::path tmp = path.string() + ".new";
+#ifdef WIN32
+    const int fd = ::open(tmp.string().c_str(),
+                          O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600);
+#else
     const int fd = ::open(tmp.string().c_str(),
                           O_WRONLY | O_CREAT | O_TRUNC, 0600);
+#endif
     if (fd < 0) {
         std::cerr << "Mempool: cannot open " << tmp.string()
                   << " for writing\n";

@@ -15,7 +15,7 @@ namespace NetParams {
 
 const uint8_t MAINNET_MAGIC[4] = {0xB6, 0xFD, 0xFA, 0x84};
 const char* NETWORK_ID = "moneu";
-const char* USER_AGENT = "/MONEU:0.2.0/";
+const char* USER_AGENT = "/MONEU:0.2.2/";
 
 const uint16_t DEFAULT_PORT = 8327;
 const uint16_t RPC_PORT = 8328;
@@ -57,6 +57,7 @@ const uint32_t MAX_OP_RETURN_SIZE = 300;
 const int64_t MIN_FEE_PER_BYTE = 1;
 const int64_t MIN_TX_FEE = 1000;
 const int64_t DUST_THRESHOLD = 1000;
+const uint32_t FEES_TO_MINER_HEIGHT = 55000;
 
 const uint32_t NOISE_LEAF_COUNT = NOISE_LEAF_COUNT_VALUE;
 const uint32_t NOISE_PROOFS_PER_INPUT = NOISE_PROOFS_PER_INPUT_VALUE;
