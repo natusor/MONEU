@@ -16,6 +16,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <cstdint>
 
 #include <boost/filesystem.hpp>
@@ -98,7 +99,14 @@ private:
 
     bool ConnectBlockLocked(const Block& block);
     bool DisconnectTipLocked();
-    bool ActivateBestChainLocked(const bytes32& newTipHash);
+    bool ActivateBestChainLocked(const bytes32& newTipHash,
+                                 bool tipValidated);
+
+    // Blocks that failed full validation while a reorg tried to connect
+    // them, and every block known to descend from one. Kept in memory so a
+    // peer offering the same bad branch again is turned away at once
+    // instead of triggering another reorg attempt.
+    std::set<bytes32>          mInvalidBlocks;
     void RollbackConnectedLocked(const std::vector<bytes32>& connected);
     bool IsOnActiveChainLocked(const bytes32& blockHash) const;
 

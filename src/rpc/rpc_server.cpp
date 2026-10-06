@@ -1481,7 +1481,7 @@ void RPCServer::RegisterBuiltinCommands() {
         [](const RPCRequest&,
            const RPCContext& ctx) -> json {
             json result;
-            result["version"]   = "0.2.2";
+            result["version"]   = "0.2.3";
             result["network"]   = NetParams::NETWORK_ID;
             result["useragent"] = NetParams::USER_AGENT;
             // From the running configuration, not the compiled default. A

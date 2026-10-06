@@ -15,7 +15,7 @@ namespace NetParams {
 
 const uint8_t MAINNET_MAGIC[4] = {0xB6, 0xFD, 0xFA, 0x84};
 const char* NETWORK_ID = "moneu";
-const char* USER_AGENT = "/MONEU:0.2.2/";
+const char* USER_AGENT = "/MONEU:0.2.3/";
 
 const uint16_t DEFAULT_PORT = 8327;
 const uint16_t RPC_PORT = 8328;
@@ -73,6 +73,7 @@ const Checkpoint MAINNET_CHECKPOINTS[] = {
     {4500, "0000000086a68638d2b5c4b8a85ccdd77625c9e4a1c5f02d5b8b6e2354ea02c9"},
     {10101, "000000004cafc6ae22766e7c521692c4d3be10fe40773d7ee6780d40ba7f6428"},
     {24000, "000000000e12a3ce7dbfa619de496777ac0cf9c26a360c0d50eafb41cee88d0c"},
+    {43000, "000000000255b50b1b459f4442a1c6555003194996d6dfc34b699e45b5dee08d"},
 
 };
 const size_t CHECKPOINT_COUNT = sizeof(MAINNET_CHECKPOINTS) / sizeof(Checkpoint);

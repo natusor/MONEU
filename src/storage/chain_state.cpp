@@ -1049,6 +1049,11 @@ bool ChainState::AcceptBlock(const Block& block)
     }
 
     const bytes32 prevHash = hdr.GetPrevBlockHash();
+
+    if (mInvalidBlocks.count(blockHash) != 0) {
+        return false;
+    }
+
     bytes32 parentWork;
     parentWork.fill(0);
     uint32_t parentHeight = 0;
@@ -1089,6 +1094,17 @@ bool ChainState::AcceptBlock(const Block& block)
         return false;
     }
 
+    // A child of a block already found invalid is refused, and remembered
+    // only once it has shown real proof of work, so nobody can grow the
+    // list for free.
+    if (mInvalidBlocks.count(prevHash) != 0) {
+        mInvalidBlocks.insert(blockHash);
+        MONEU_LOG_WARN("Block rejected at height " +
+                       std::to_string(blockHeight) +
+                       ": it builds on a block already found invalid");
+        return false;
+    }
+
     // History below the highest checkpoint this node holds is settled, and
     // nothing that would branch from it is stored.
     //
@@ -1113,13 +1129,65 @@ bool ChainState::AcceptBlock(const Block& block)
         return false;
     }
 
+    // A block that extends the active tip is checked in full here, against
+    // the UTXO set as it stands, which is exactly the state its parent left.
+    //
+    // A block on a side branch cannot be checked that way: the UTXO set
+    // belongs to the active tip, not to the branch, so a payment that both
+    // branches carry is already spent here and the block would look
+    // invalid when it is not. Such a block gets only the checks that need
+    // no chain state and is stored. If its branch ever carries more work,
+    // ActivateBestChainLocked rewinds to the fork point and validates every
+    // branch block in full against the right state before it is connected.
+    const bool extendsTip = (prevHash == mBestChain.blockHash);
     {
+        // Structure, merkle root, leaf root and duplicate checks come first
+        // and never mark the hash as invalid: a peer can damage the body of
+        // a good block without changing its header hash, and the real block
+        // must still be accepted when it arrives.
         validation::BlockValidationState vstate;
-        if (!validation::BlockValidation::ValidateBlock(
+        if (!validation::BlockValidation::CheckBlock(block, vstate) ||
+            !validation::BlockValidation::CheckBlockReveals(
                 block, *mUTXOSet, blockHeight, vstate)) {
             MONEU_LOG_WARN("Block rejected at height " +
                            std::to_string(blockHeight) + ": " +
                            vstate.reason);
+            return false;
+        }
+
+        // Past this point the transactions are bound to the header, so a
+        // failure is a property of the block itself.
+
+        // The coinbase is not run through the per-transaction output checks
+        // in CheckBlock, and summing outputs that overflow throws. A side
+        // block skips the UTXO check below, so without this an overflowing
+        // coinbase would be stored and only blow up later, in the middle
+        // of a reorg.
+        bool coinbaseOk = block.GetTransactionCount() > 0;
+        if (coinbaseOk) {
+            try {
+                const int64_t cbOut = block.GetTransactions()[0].GetValueOut();
+                coinbaseOk = cbOut >= 0 &&
+                    NetParams::CheckMoneyRange(static_cast<uint64_t>(cbOut));
+            } catch (const std::exception&) {
+                coinbaseOk = false;
+            }
+        }
+        if (!coinbaseOk) {
+            MONEU_LOG_WARN("Block rejected at height " +
+                           std::to_string(blockHeight) +
+                           ": coinbase outputs are out of range");
+            mInvalidBlocks.insert(blockHash);
+            return false;
+        }
+
+        if (extendsTip &&
+            !validation::BlockValidation::CheckBlockTransactionsWithUTXO(
+                block, *mUTXOSet, blockHeight, vstate)) {
+            MONEU_LOG_WARN("Block rejected at height " +
+                           std::to_string(blockHeight) + ": " +
+                           vstate.reason);
+            mInvalidBlocks.insert(blockHash);
             return false;
         }
     }
@@ -1127,20 +1195,42 @@ bool ChainState::AcceptBlock(const Block& block)
     const bytes32 blockWork =
         PNC::AddChainWork(parentWork, hdr.GetBits());
 
+    // WriteBlock points the transaction index at this block for every
+    // transaction it carries. A side-branch block often carries a payment
+    // that the active chain already holds, and the index must keep naming
+    // the active block for it, or getrawtransaction would report the
+    // payment in a block that is not on the chain. The entries are read
+    // first and put back after; a reorg onto this branch rewrites them in
+    // WriteBlockConnected.
+    std::vector<std::pair<bytes32, bytes32> > keepTxIndex;
+    if (!extendsTip) {
+        for (const auto& tx : block.GetTransactions()) {
+            bytes32 indexed;
+            if (mBlockData->ReadTxIndex(tx.GetHash(), indexed)) {
+                keepTxIndex.push_back(std::make_pair(tx.GetHash(), indexed));
+            }
+        }
+    }
+
     DiskBlockPos pos;
     if (!mBlockData->WriteBlock(block, blockHeight, blockWork, pos)) {
         std::cerr << "ChainState: AcceptBlock - WriteBlock failed\n";
         return false;
     }
 
+    for (size_t i = 0; i < keepTxIndex.size(); ++i) {
+        mBlockData->WriteTxIndex(keepTxIndex[i].first, keepTxIndex[i].second);
+    }
+
     if (PNC::CompareWork(blockWork, mBestChain.chainWork) <= 0) {
         return true;
     }
 
-    return ActivateBestChainLocked(blockHash);
+    return ActivateBestChainLocked(blockHash, extendsTip);
 }
 
-bool ChainState::ActivateBestChainLocked(const bytes32& newTipHash)
+bool ChainState::ActivateBestChainLocked(const bytes32& newTipHash,
+                                         bool tipValidated)
 {
     std::vector<bytes32> newBranch;
     bytes32 cursor = newTipHash;
@@ -1167,6 +1257,60 @@ bool ChainState::ActivateBestChainLocked(const bytes32& newTipHash)
         cursor = e.hashPrev;
     }
 
+    const uint32_t oldHeight = mBestChain.height;
+
+    // The mempool-sync queues as they stood before this attempt. A refused
+    // reorg that ends on exactly the chain it started from puts them back,
+    // so whatever it queued on the way is dropped again; otherwise the
+    // mempool would later treat the refused branch's transactions as
+    // confirmed. Copies, not sizes, because the disconnected queue may
+    // evict from its front while the attempt runs.
+    const bytes32 startTip = mBestChain.blockHash;
+    const std::vector<Transaction> syncConnectedBefore    = mSyncConnected;
+    const std::vector<Transaction> syncDisconnectedBefore = mSyncDisconnected;
+    const size_t                   syncBytesBefore        = mSyncDisconnectedBytes;
+    auto restoreSyncQueues = [&]() {
+        mSyncConnected         = syncConnectedBefore;
+        mSyncDisconnected      = syncDisconnectedBefore;
+        mSyncDisconnectedBytes = syncBytesBefore;
+    };
+
+    // Blocks taken off the active chain, tip first, so they can be put back
+    // if the new branch turns out to be invalid.
+    std::vector<bytes32> disconnected;
+
+    auto reconnectOld = [&]() -> bool {
+        for (auto it = disconnected.rbegin(); it != disconnected.rend(); ++it) {
+            BlockIndexEntry e;
+            Block blk;
+            bool back = false;
+            try {
+                back = mBlockData->ReadBlockIndex(*it, e) &&
+                       mBlockData->ReadBlock(blk, e.blockPos) &&
+                       ConnectBlockLocked(blk);
+            } catch (const std::exception&) {
+                back = false;
+            }
+            if (!back) {
+                MONEU_LOG_ERROR("ChainState: reorg - could not restore the "
+                                "previous chain at height " +
+                                std::to_string(mBestChain.height + 1) +
+                                "; restart the node to replay it");
+                return false;
+            }
+        }
+        return mBestChain.blockHash == startTip;
+    };
+
+    // Put the old chain back; only when that fully succeeded are the
+    // mempool-sync queues rewound, since otherwise the connects and
+    // disconnects they record really happened.
+    auto restoreOld = [&]() {
+        if (reconnectOld()) {
+            restoreSyncQueues();
+        }
+    };
+
     while (true) {
         if (forkIsGenesis) {
             if (mBestChain.height == 0) break;
@@ -1176,36 +1320,105 @@ bool ChainState::ActivateBestChainLocked(const bytes32& newTipHash)
         if (mBestChain.height == 0) {
             std::cerr << "ChainState: reorg - underflowed to genesis "
                          "without reaching fork\n";
+            restoreOld();
             return false;
         }
-        if (!DisconnectTipLocked()) {
+        const bytes32 leaving = mBestChain.blockHash;
+        bool left = false;
+        try {
+            left = DisconnectTipLocked();
+        } catch (const std::exception& ex) {
+            MONEU_LOG_ERROR(std::string("ChainState: reorg - disconnect "
+                                        "threw: ") + ex.what());
+            // A write error after the tip already moved still counts as a
+            // disconnect, so the block is put back with the others.
+            if (mBestChain.blockHash != leaving) {
+                disconnected.push_back(leaving);
+            }
+        }
+        if (!left) {
             std::cerr << "ChainState: reorg - disconnect failed\n";
+            restoreOld();
             return false;
         }
+        disconnected.push_back(leaving);
     }
+
+    // Every branch block is validated in full here, against the UTXO set as
+    // its own parent left it. The only exception is a single block that
+    // extends the tip directly, which AcceptBlock has already validated
+    // against this very state.
+    const bool skipValidation =
+        tipValidated && disconnected.empty() && newBranch.size() == 1;
 
     std::vector<bytes32> connected;
     for (auto it = newBranch.rbegin(); it != newBranch.rend(); ++it) {
         BlockIndexEntry e;
-        if (!mBlockData->ReadBlockIndex(*it, e)) {
-            std::cerr << "ChainState: reorg - missing branch block on "
-                         "connect\n";
-            RollbackConnectedLocked(connected);
-            return false;
-        }
         Block blk;
-        if (!mBlockData->ReadBlock(blk, e.blockPos)) {
-            std::cerr << "ChainState: reorg - cannot read branch block\n";
-            RollbackConnectedLocked(connected);
-            return false;
+        bool ok = false;
+        std::string reason = "cannot read the block";
+        bool invalid = false;
+
+        // Nothing thrown in here may escape: the old chain is already
+        // disconnected, and only the code below puts it back.
+        try {
+            ok = mBlockData->ReadBlockIndex(*it, e) &&
+                 mBlockData->ReadBlock(blk, e.blockPos);
+
+            if (ok && !skipValidation) {
+                validation::BlockValidationState vstate;
+                if (!validation::BlockValidation::
+                        CheckBlockTransactionsWithUTXO(
+                            blk, *mUTXOSet, mBestChain.height + 1, vstate)) {
+                    ok = false;
+                    invalid = true;
+                    reason = vstate.reason;
+                }
+            }
+            if (ok && !ConnectBlockLocked(blk)) {
+                ok = false;
+                invalid = true;
+                reason = "connect failed (linkage, difficulty or proof of "
+                         "work)";
+            }
+        } catch (const std::exception& ex) {
+            // Block content that could throw is refused before it is ever
+            // stored, so an exception here is a disk or database failure,
+            // not a verdict on the block. It is not marked invalid.
+            ok = false;
+            invalid = false;
+            reason = std::string("error while connecting: ") + ex.what();
         }
-        if (!ConnectBlockLocked(blk)) {
-            std::cerr << "ChainState: reorg - branch block rejected on "
-                         "connect; rolling back\n";
-            RollbackConnectedLocked(connected);
+
+        if (!ok) {
+            if (invalid) {
+                // This block and everything built on it can never be
+                // connected; remember that so the branch is not retried.
+                for (auto bad = it; bad != newBranch.rend(); ++bad) {
+                    mInvalidBlocks.insert(*bad);
+                }
+            }
+            MONEU_LOG_WARN("Reorg refused at height " +
+                           std::to_string(mBestChain.height + 1) + ": " +
+                           reason + "; staying on the previous chain");
+            try {
+                RollbackConnectedLocked(connected);
+            } catch (const std::exception& ex) {
+                MONEU_LOG_ERROR(std::string("ChainState: reorg - rollback "
+                                            "threw: ") + ex.what());
+            }
+            restoreOld();
             return false;
         }
         connected.push_back(*it);
+    }
+
+    if (!disconnected.empty()) {
+        MONEU_LOG_WARN("Reorg: left " + std::to_string(disconnected.size()) +
+                       " block(s) from height " + std::to_string(oldHeight) +
+                       ", connected " + std::to_string(connected.size()) +
+                       ", new tip height " +
+                       std::to_string(mBestChain.height));
     }
 
     return true;
