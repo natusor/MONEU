@@ -42,6 +42,11 @@ static const int64_t  DOWNLOAD_CHECK_INTERVAL_SEC = 20;
 static const int64_t  TIMEOUT_SEC            = 1200;
 static const int64_t  HANDSHAKE_TIMEOUT_SEC  = 30;
 
+// A peer that takes no data from us for this long is disconnected. Sends
+// never wait on one peer, so a peer that stops reading cannot hold up the
+// messages to everyone else.
+static const int64_t  SEND_STALL_TIMEOUT_SEC = 60;
+
 // How long to wait for one outbound connection to come up. The kernel keeps
 // resending the first packet for over two minutes before it gives up, which
 // is far longer than a node should spend on an address nobody answers when
@@ -247,6 +252,11 @@ public:
 
     std::deque<std::vector<uint8_t>> sendQueue;
     mutable std::mutex               sendMutex;
+
+    // Used only by MessageLoop: how much of the message at the front of the
+    // queue has already gone out, and since when the peer has taken nothing.
+    size_t                           sendOffset = 0;
+    int64_t                          sendStallSince = 0;
 
     tcp::socket                         socket;
     std::unique_ptr<asio::steady_timer> timeoutTimer;

@@ -448,7 +448,7 @@ void ConnManager::AcceptLoop() {
                 }
                 continue;
             }
-            node->socket.non_blocking(false, ec);
+            node->socket.non_blocking(true, ec);
             std::string ip = node->socket
                 .remote_endpoint(ec)
                 .address().to_string();
@@ -659,7 +659,7 @@ bool ConnManager::ConnectToAddress(const NetAddress& addr) {
         if (connected) break;
     }
 
-    node->socket.non_blocking(false, ec);
+    node->socket.non_blocking(true, ec);
 
     if (!connected || !mRunning) {
         if (mRunning) {
@@ -1897,10 +1897,33 @@ void ConnManager::MessageLoop() {
                     node->sendMutex);
                 std::swap(toSend, node->sendQueue);
             }
-            for (const auto& data : toSend) {
+            if (toSend.empty()) {
+                node->sendStallSince = 0;
+                continue;
+            }
+
+            // The socket is non-blocking: a peer whose receive window is
+            // full gets what fits now and the rest on a later pass, and
+            // the loop moves on to the next peer instead of waiting.
+            bool failed  = false;
+            bool blocked = false;
+            while (!toSend.empty()) {
+                const std::vector<uint8_t>& data = toSend.front();
+                if (node->sendOffset >= data.size()) {
+                    toSend.pop_front();
+                    node->sendOffset = 0;
+                    continue;
+                }
                 boost::system::error_code ec;
-                asio::write(node->socket,
-                            asio::buffer(data), ec);
+                const size_t n = node->socket.write_some(
+                    asio::buffer(data.data() + node->sendOffset,
+                                 data.size() - node->sendOffset),
+                    ec);
+                if (ec == asio::error::would_block ||
+                    ec == asio::error::try_again) {
+                    blocked = true;
+                    break;
+                }
                 if (ec) {
                     std::cerr << "ConnManager: write"
                                  " error to "
@@ -1908,13 +1931,34 @@ void ConnManager::MessageLoop() {
                               << ": " << ec.message()
                               << " (" << ec.value()
                               << ")\n";
-                    DisconnectNode(node,
-                                   ec.message());
+                    DisconnectNode(node, ec.message());
+                    failed = true;
                     break;
                 }
-                node->bytesSent += data.size();
-                node->lastSend =
-                    GetCurrentTimestamp();
+                node->sendOffset    += n;
+                node->bytesSent     += n;
+                node->lastSend       = GetCurrentTimestamp();
+                node->sendStallSince = 0;
+            }
+            if (failed) continue;
+
+            if (blocked) {
+                const int64_t now = GetCurrentTimestamp();
+                if (node->sendStallSince == 0) {
+                    node->sendStallSince = now;
+                } else if (now - node->sendStallSince >=
+                           SEND_STALL_TIMEOUT_SEC) {
+                    DisconnectNode(node, "peer takes no data");
+                    continue;
+                }
+                // What did not go out goes back to the front of the
+                // queue, ahead of anything queued meanwhile, so the order
+                // of messages on the wire stays the same.
+                std::lock_guard<std::mutex> lock(node->sendMutex);
+                for (auto it = toSend.rbegin(); it != toSend.rend(); ++it)
+                    node->sendQueue.push_front(std::move(*it));
+            } else {
+                node->sendStallSince = 0;
             }
         }
     }
