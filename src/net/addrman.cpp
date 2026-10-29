@@ -116,6 +116,10 @@ AddrMan::AddrMan()
 }
 
 std::string AddrMan::GroupOf(const std::string& ip) {
+    if (ip.size() > 6 && ip.compare(ip.size() - 6, 6, ".onion") == 0) {
+        return "o:" + ip.substr(0, 1);
+    }
+
     unsigned char v4[4];
     if (inet_pton(AF_INET, ip.c_str(), v4) == 1) {
         char out[16];

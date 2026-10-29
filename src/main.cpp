@@ -13,6 +13,7 @@
 #include <csignal>
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>
 #include <thread>
 #include <chrono>
 #include <iomanip>
@@ -1078,6 +1079,19 @@ int main(int argc, char* argv[]) {
             if (arg.find("-rpcallowip=") == 0)
                 node.config.GetRPCMutable()
                     .rpcAllowIp.push_back(arg.substr(12));
+            if (arg.find("-proxy=") == 0) {
+                node.config.GetNetworkMutable().proxy    = arg.substr(7);
+                node.config.GetNetworkMutable().discover = false;
+                node.config.GetNetworkMutable().portMap  = false;
+            }
+            if (arg.find("-onion=") == 0)
+                node.config.GetNetworkMutable().onionProxy = arg.substr(7);
+            if (arg.find("-onlynet=") == 0)
+                node.config.GetNetworkMutable()
+                    .onlyNets.push_back(arg.substr(9));
+            if (arg.find("-bind=") == 0)
+                node.config.GetNetworkMutable()
+                    .binds.push_back(arg.substr(6));
         }
         if (HasArg(args, "mine"))
             node.config.GetMiningMutable().enabled = true;
@@ -1140,9 +1154,36 @@ int main(int argc, char* argv[]) {
         netOptions.listen        = node.config.GetNetwork().listen;
         netOptions.seedNodes     = node.config.GetNetwork().seedNodes;
         netOptions.addNodes      = node.config.GetNetwork().addNodes;
+        netOptions.proxy         = node.config.GetNetwork().proxy;
+        netOptions.onionProxy    = node.config.GetNetwork().onionProxy;
+        netOptions.proxyRandomize= node.config.GetNetwork().proxyRandomize;
+        netOptions.onlyNets      = node.config.GetNetwork().onlyNets;
+        netOptions.discover      = node.config.GetNetwork().discover;
+        netOptions.listenOnion   = node.config.GetNetwork().listenOnion &&
+                                   node.config.GetNetwork().listen;
+        netOptions.torControl    = node.config.GetNetwork().torControl;
+        netOptions.torPassword   = node.config.GetNetwork().torPassword;
+        netOptions.binds         = node.config.GetNetwork().binds;
+        netOptions.onionKeyFile  = (node.dataDir->GetDataDir() /
+                                    "onion_v3_private_key").string();
+        netOptions.onionBindPort = static_cast<uint16_t>(
+            netOptions.listenPort + 2);
         auto bestChain           = node.chainState->GetBestChain();
         netOptions.bestHeight    = bestChain.height;
         netOptions.bestBlockHash = bestChain.blockHash;
+
+#ifndef WIN32
+        {
+            const char* preload = std::getenv("LD_PRELOAD");
+            if (preload && std::strstr(preload, "torsocks")) {
+                LOG_WARN("moneud is running under torsocks, which blocks "
+                         "connections to 127.0.0.1: proxy=, the Tor control "
+                         "port and addnode=127.0.0.1 do not work under it. "
+                         "Start moneud without torsocks and set "
+                         "proxy=127.0.0.1:9050 in moneu.conf");
+            }
+        }
+#endif
 
         node.connManager = std::make_shared<net::ConnManager>(netOptions);
 
@@ -1338,16 +1379,29 @@ int main(int argc, char* argv[]) {
                  " seed addresses available");
 
         {
-            const std::string& ext = node.config.GetNetwork().externalIp;
-            if (!ext.empty()) {
-                node.connManager->SetExternalAddress(
-                    ext, node.config.GetNetwork().port);
-                LOG_INFO("Announcing self as " + ext + ":" +
-                         std::to_string(node.config.GetNetwork().port));
-            } else {
+            std::vector<std::string> exts =
+                node.config.GetNetwork().externalIps;
+            if (exts.empty() && !node.config.GetNetwork().externalIp.empty())
+                exts.push_back(node.config.GetNetwork().externalIp);
+            if (!exts.empty()) {
+                for (size_t i = 0; i < exts.size(); ++i) {
+                    if (i == 0) {
+                        node.connManager->SetExternalAddress(
+                            exts[i], node.config.GetNetwork().port);
+                    } else {
+                        node.connManager->AddExternalAddress(
+                            exts[i], node.config.GetNetwork().port);
+                    }
+                    LOG_INFO("Announcing self as " + exts[i] + ":" +
+                             std::to_string(node.config.GetNetwork().port));
+                }
+            } else if (node.config.GetNetwork().discover) {
                 LOG_INFO("No 'externalip' set: this node will announce "
                          "whichever of its own interface addresses each "
                          "peer can reach");
+            } else {
+                LOG_INFO("No 'externalip' set and discover=0: this node "
+                         "does not announce its own IP address");
             }
         }
 

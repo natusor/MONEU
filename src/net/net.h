@@ -8,6 +8,8 @@
 #include "../primitives/transaction.h"
 #include "../chainparams.h"
 #include "addrman.h"
+#include "socks5.h"
+#include "torcontrol.h"
 
 #include <string>
 #include <vector>
@@ -52,6 +54,12 @@ static const int64_t  SEND_STALL_TIMEOUT_SEC = 60;
 // is far longer than a node should spend on an address nobody answers when
 // there are others waiting behind it.
 static const int64_t  CONNECT_TIMEOUT_SEC    = 10;
+
+static const int64_t  HANDSHAKE_TIMEOUT_PROXY_SEC = 60;
+
+static const int64_t  STALE_TIP_SEC          = 15 * 60;
+
+static const size_t   MAX_CONNECT_ATTEMPTS_PER_PASS = 16;
 static const uint32_t MAX_INV_SIZE           = 50000;
 
 static const size_t   ADDR_RELAY_PEERS = 2;
@@ -219,6 +227,8 @@ public:
     NodeId              id;
     NetAddress          addr;
     bool                inbound;
+    bool                viaProxy;
+    bool                onionInbound;
     std::atomic<bool>   connected;
     bool                versionSent;
     bool                versionAcked;
@@ -266,6 +276,8 @@ public:
                   bool isInbound)
         : id(nodeId)
         , inbound(isInbound)
+        , viaProxy(false)
+        , onionInbound(false)
         , connected(false)
         , versionSent(false)
         , versionAcked(false)
@@ -348,6 +360,20 @@ struct ConnManagerOptions {
     std::vector<std::string> seedNodes;
     std::vector<std::string> addNodes;
 
+    std::string proxy;
+    std::string onionProxy;
+    bool        proxyRandomize;
+    std::vector<std::string> onlyNets;
+    bool        discover;
+
+    std::vector<std::string> binds;
+
+    bool        listenOnion;
+    std::string torControl;
+    std::string torPassword;
+    std::string onionKeyFile;
+    uint16_t    onionBindPort;
+
     ConnManagerOptions()
         : listenPort(NetParams::DEFAULT_PORT)
         , maxConnections(
@@ -359,9 +385,22 @@ struct ConnManagerOptions {
         , listen(true)
         , bestHeight(0)
         , bestRound(0)
+        , proxyRandomize(true)
+        , discover(true)
+        , listenOnion(false)
+        , torControl(DEFAULT_TOR_CONTROL)
+        , onionBindPort(0)
     {
         bestBlockHash.fill(0);
     }
+};
+
+enum class NetKind {
+    IPV4,
+    IPV6,
+    ONION,
+    NAME,
+    INVALID
 };
 
 class ConnManager
@@ -369,7 +408,16 @@ class ConnManager
 {
 private:
     asio::io_context          mIO;
-    tcp::acceptor             mAcceptor;
+
+    struct Listener {
+        std::unique_ptr<tcp::acceptor> acceptor;
+        bool                           onion;
+    };
+    std::vector<Listener>     mListeners;
+    std::vector<NetAddress>   mBinds;
+    std::vector<NetAddress>   mOnionBinds;
+    bool                      mBindOnAny;
+
     mutable std::mutex        mNodesMutex;
     std::unordered_map<NodeId, NodePtr> mNodes;
     std::atomic<NodeId>       mNextNodeId;
@@ -380,7 +428,7 @@ private:
     std::vector<std::thread>  mThreads;
     AddrMan                   mAddrMan;
     std::vector<NetAddress>   mKnownAddresses;
-    NetAddress                mExternalAddress;
+    std::vector<NetAddress>   mExternalAddresses;
     int64_t                   mLastSelfAdvertise;
     int64_t                   mLastAddressSave;
     fs::path                  mAddressFile;
@@ -388,6 +436,25 @@ private:
     uint64_t                  mLocalNonce;
 
     int64_t                   mLastAddrRequest;
+
+    std::vector<NetAddress>   mOperatorAddresses;
+    std::vector<NetAddress>   mSeedAddresses;
+
+    NetAddress                mProxy;
+    bool                      mHaveProxy;
+    NetAddress                mOnionProxy;
+    bool                      mHaveOnionProxy;
+    bool                      mNetConfigError;
+    mutable std::mutex        mProxyMutex;
+    bool                      mReachIPv4;
+    bool                      mReachIPv6;
+    bool                      mReachOnion;
+
+    std::unique_ptr<TorController> mTor;
+    std::string               mOnionService;
+
+    std::atomic<int64_t>      mLastTipChange;
+    std::atomic<int64_t>      mLastStaleProbe;
 
     struct InFlightEntry {
         NodeId  peer;
@@ -507,6 +574,19 @@ private:
     void DecrementConnectionCount(
         const std::string& ip);
     bool ConnectToAddress(const NetAddress& addr);
+    bool ConnectSocket(NodePtr node, const tcp::endpoint& endpoint);
+    bool ConnectThroughProxy(NodePtr node, const NetAddress& proxy,
+                             const NetAddress& addr);
+    bool GetProxyFor(NetKind kind, NetAddress& out) const;
+    bool IsReachableKind(NetKind kind) const;
+    size_t CountFullyConnected() const;
+    void AcceptOne(tcp::acceptor& acceptor, bool onion);
+    bool BindListener(const NetAddress& addr, bool onion);
+    void CloseListeners();
+
+    void OnOnionService(const std::string& host);
+    void OnOnionServiceLost(const std::string& host);
+    void UseDefaultOnionProxy();
     bool AddKnownAddress(const NetAddress& addr);
     bool AddKnownAddressFrom(const NetAddress& addr,
                              const std::string& source);
@@ -563,6 +643,7 @@ public:
     std::vector<NetAddress> GetKnownAddresses() const;
 
     void SetExternalAddress(const std::string& ip, uint16_t port);
+    void AddExternalAddress(const std::string& ip, uint16_t port);
 
     // True when the address is one of ours: a local interface address or the
     // one given as externalip. Checked before every outbound attempt so the
@@ -584,6 +665,19 @@ public:
     static bool IsUsableAddress(const std::string& ip);
 
     static bool IsPrivateAddress(const std::string& ip);
+
+    static bool IsOnionAddress(const std::string& host);
+
+    static NetKind Classify(const std::string& host);
+
+    static bool ParseHostPort(const std::string& in, uint16_t defaultPort,
+                              NetAddress& out);
+
+    bool IsReachable(const std::string& host) const;
+
+    std::string GetProxyString() const;
+    std::string GetOnionProxyString() const;
+    std::string GetOnionService() const;
 
     std::vector<NetAddress> mLocalAddresses;
     mutable std::mutex      mLocalAddrMutex;

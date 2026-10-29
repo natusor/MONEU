@@ -1904,6 +1904,12 @@ void RegisterNetworkRPCCommands(RPCTable& table) {
                     ctx.connManager->GetTotalBytesRecv();
                 result["totalbytessent"] =
                     ctx.connManager->GetTotalBytesSent();
+                result["proxy"] =
+                    ctx.connManager->GetProxyString();
+                result["onionproxy"] =
+                    ctx.connManager->GetOnionProxyString();
+                result["onionaddress"] =
+                    ctx.connManager->GetOnionService();
             }
             return result;
         }

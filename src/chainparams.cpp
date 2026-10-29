@@ -92,7 +92,9 @@ const size_t DNS_SEED_COUNT = sizeof(DNS_SEEDS) / sizeof(char*);
 
 const char* FIXED_SEEDS[] = {
     "135.181.255.219:8327",
-     "92.5.174.122:8327"
+     "92.5.174.122:8327",
+    "y3g6dpbvfdk6eenxcwrotafmj5apvzasmvacdcpn3224vyambab6ssid.onion:8327",
+    "ff3tclm3vkkzr6k7rm4bgzznvzja6xxf6765h7voz7zjjx4z7dcfbnid.onion:8327"
 
 };
 const size_t FIXED_SEED_COUNT = sizeof(FIXED_SEEDS) / sizeof(char*);

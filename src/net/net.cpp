@@ -13,8 +13,10 @@
 #endif
 #include <map>
 #include <set>
+#include <cctype>
 #include <cstdio>
 #include "log/log.h"
+#include "../crypto/sha3_256.h"
 #include <ctime>
 extern "C" {
 #include "../crypto/rand.h"
@@ -213,7 +215,7 @@ void Node::PushMessage(const NetMessage& msg) {
 
 ConnManager::ConnManager(
     const ConnManagerOptions& options)
-    : mAcceptor(mIO)
+    : mBindOnAny(true)
     , mNextNodeId(1)
     , mRunning(false)
     , mNetworkActive(true)
@@ -221,9 +223,93 @@ ConnManager::ConnManager(
     , mLastSelfAdvertise(0)
     , mLastAddressSave(0)
     , mLastAddrRequest(0)
+    , mHaveProxy(false)
+    , mHaveOnionProxy(false)
+    , mNetConfigError(false)
+    , mReachIPv4(true)
+    , mReachIPv6(true)
+    , mReachOnion(true)
+    , mLastTipChange(0)
+    , mLastStaleProbe(0)
 {
     random_buffer(reinterpret_cast<uint8_t*>(&mLocalNonce),
                   sizeof(mLocalNonce));
+
+    if (!mOptions.proxy.empty()) {
+        if (ParseHostPort(mOptions.proxy, 9050, mProxy) &&
+            (Classify(mProxy.ip) == NetKind::IPV4 ||
+             Classify(mProxy.ip) == NetKind::IPV6)) {
+            mHaveProxy = true;
+        } else {
+            MONEU_LOG_ERROR("P2P: cannot use proxy=" + mOptions.proxy +
+                            " (give the IP address and port of the proxy)");
+            mNetConfigError = true;
+        }
+    }
+    if (!mOptions.onionProxy.empty()) {
+        if (ParseHostPort(mOptions.onionProxy, 9050, mOnionProxy) &&
+            (Classify(mOnionProxy.ip) == NetKind::IPV4 ||
+             Classify(mOnionProxy.ip) == NetKind::IPV6)) {
+            mHaveOnionProxy = true;
+        } else {
+            MONEU_LOG_ERROR("P2P: cannot use onion=" + mOptions.onionProxy +
+                            " (give the IP address and port of the proxy)");
+            mNetConfigError = true;
+        }
+    } else if (mHaveProxy) {
+        mOnionProxy     = mProxy;
+        mHaveOnionProxy = true;
+    }
+
+    if (!mOptions.onlyNets.empty()) {
+        mReachIPv4  = false;
+        mReachIPv6  = false;
+        mReachOnion = false;
+        for (const std::string& raw : mOptions.onlyNets) {
+            std::string n;
+            for (char c : raw) n.push_back(static_cast<char>(std::tolower(
+                static_cast<unsigned char>(c))));
+            if (n == "ipv4") mReachIPv4 = true;
+            else if (n == "ipv6") mReachIPv6 = true;
+            else if (n == "onion" || n == "tor") mReachOnion = true;
+            else {
+                MONEU_LOG_ERROR("P2P: unknown onlynet=" + raw +
+                                " (use ipv4, ipv6 or onion)");
+                mNetConfigError = true;
+            }
+        }
+    }
+
+    for (const std::string& raw : mOptions.binds) {
+        const size_t eq = raw.rfind('=');
+        NetAddress a;
+        bool ok = false;
+        bool onion = false;
+        if (eq == std::string::npos) {
+            ok = ParseHostPort(raw, mOptions.listenPort, a);
+        } else if (raw.substr(eq + 1) == "onion") {
+            onion = true;
+            ok = ParseHostPort(raw.substr(0, eq), mOptions.onionBindPort, a);
+        }
+        const NetKind kind = ok ? Classify(a.ip) : NetKind::INVALID;
+        if (kind != NetKind::IPV4 && kind != NetKind::IPV6) {
+            MONEU_LOG_ERROR("P2P: cannot use bind=" + raw +
+                            " (give an IP address, optionally :port and =onion)");
+            mNetConfigError = true;
+            continue;
+        }
+        if (onion) {
+            mOnionBinds.push_back(a);
+        } else {
+            mBinds.push_back(a);
+        }
+    }
+    mBindOnAny = mOptions.binds.empty();
+    if (mOnionBinds.empty() && mOptions.onionBindPort != 0) {
+        mOnionBinds.push_back(NetAddress("127.0.0.1", mOptions.onionBindPort));
+    }
+
+    mLastTipChange = GetCurrentTimestamp();
 }
 
 ConnManager::~ConnManager() {
@@ -273,8 +359,10 @@ void ConnManager::StartHandshakeTimeout(
     NodePtr node)
 {
     auto self = shared_from_this();
+    const bool overTor = node->viaProxy || node->onionInbound;
     node->timeoutTimer->expires_after(
-        std::chrono::seconds(HANDSHAKE_TIMEOUT_SEC));
+        std::chrono::seconds(overTor ? HANDSHAKE_TIMEOUT_PROXY_SEC
+                                     : HANDSHAKE_TIMEOUT_SEC));
     node->timeoutTimer->async_wait(
         [this, self, node](
             const boost::system::error_code& ec) {
@@ -299,33 +387,33 @@ void ConnManager::CancelHandshakeTimeout(
 bool ConnManager::Start(
     const NetCallbacks& callbacks)
 {
+    if (mNetConfigError) return false;
     mCallbacks = callbacks;
     mRunning   = true;
+    bool onionListening = false;
     if (mOptions.listen) {
-        try {
-            tcp::endpoint endpoint(
-                tcp::v4(), mOptions.listenPort);
-            mAcceptor.open(endpoint.protocol());
-            mAcceptor.set_option(
-                asio::socket_base::reuse_address(
-                    true));
-            mAcceptor.bind(endpoint);
-            mAcceptor.listen();
-            mAcceptor.non_blocking(true);
-            std::cerr << "ConnManager: listening "
-                         "on port "
-                      << mOptions.listenPort << "\n";
-        } catch (const std::exception& e) {
-            std::cerr << "ConnManager: listen "
-                         "failed: "
-                      << e.what() << "\n";
+        for (const auto& b : mBinds) {
+            if (!BindListener(b, false)) return false;
+        }
+        if (mBindOnAny &&
+            !BindListener(NetAddress("0.0.0.0", mOptions.listenPort), false)) {
             return false;
         }
+        for (size_t i = 0; i < mOnionBinds.size(); ++i) {
+            const bool bound = BindListener(mOnionBinds[i], true);
+            if (i == 0) onionListening = bound;
+        }
     }
-    for (const auto& s : mOptions.seedNodes)
-        AddNode(s);
-    for (const auto& a : mOptions.addNodes)
-        AddNode(a);
+
+    for (const auto& s : mOptions.seedNodes) {
+        NetAddress a;
+        if (ParseHostPort(s, mOptions.listenPort, a)) AddOperatorAddress(a);
+    }
+    for (const auto& s : mOptions.addNodes) {
+        NetAddress a;
+        if (ParseHostPort(s, mOptions.listenPort, a)) AddOperatorAddress(a);
+    }
+
     mThreads.emplace_back(
         [this]() { AcceptLoop(); });
     mThreads.emplace_back(
@@ -337,7 +425,30 @@ bool ConnManager::Start(
     mThreads.emplace_back(
         [this]() { DownloadLoop(); });
 
-    DiscoverLocalAddresses();
+    if (mOptions.discover && mBindOnAny) {
+        DiscoverLocalAddresses();
+    } else {
+        std::vector<NetAddress> externals;
+        {
+            std::lock_guard<std::mutex> lock(mAddrMutex);
+            externals = mExternalAddresses;
+        }
+        std::lock_guard<std::mutex> lock(mLocalAddrMutex);
+        for (const auto& e : externals) {
+            if (!e.ip.empty()) mLocalAddresses.push_back(e);
+        }
+        if (mOptions.discover && mOptions.listen) {
+            for (const auto& b : mBinds) {
+                bool named = false;
+                for (const auto& e : externals) {
+                    if (e.ip == b.ip) named = true;
+                }
+                if (IsRelayableAddress(b.ip) && !named) {
+                    mLocalAddresses.push_back(b);
+                }
+            }
+        }
+    }
     mWorkGuard.reset(
         new asio::executor_work_guard<asio::io_context::executor_type>(
             asio::make_work_guard(mIO)));
@@ -346,6 +457,38 @@ bool ConnManager::Start(
     });
     MONEU_LOG_INFO("P2P: listening on port " +
                    std::to_string(mOptions.listenPort));
+    if (mHaveProxy) {
+        MONEU_LOG_INFO("P2P: outbound connections go through proxy " +
+                       mProxy.ToString());
+    }
+
+    if (mOptions.listenOnion && onionListening) {
+        const NetAddress& target = mOnionBinds.front();
+        if (mOnionBinds.size() > 1) {
+            MONEU_LOG_WARN("P2P: more than one onion bind address is given, "
+                           "using " + target.ToString() + " for the onion "
+                           "service created through Tor");
+        }
+        TorControlOptions torOptions;
+        torOptions.control     = mOptions.torControl;
+        torOptions.password    = mOptions.torPassword;
+        torOptions.keyFile     = mOptions.onionKeyFile;
+        torOptions.virtualPort = NetParams::DEFAULT_PORT;
+        torOptions.target      =
+            (Classify(target.ip) == NetKind::IPV6 ? "[" + target.ip + "]"
+                                                  : target.ip) +
+            ":" + std::to_string(target.port);
+        TorControlCallbacks torCallbacks;
+        torCallbacks.onAuthenticated = [this]() { UseDefaultOnionProxy(); };
+        torCallbacks.onService = [this](const std::string& host) {
+            OnOnionService(host);
+        };
+        torCallbacks.onServiceLost = [this](const std::string& host) {
+            OnOnionServiceLost(host);
+        };
+        mTor.reset(new TorController(torOptions, torCallbacks));
+        mTor->Start();
+    }
     return true;
 }
 
@@ -363,11 +506,9 @@ void ConnManager::Stop() {
         mRunning = false;
     }
 
-    {
-        boost::system::error_code ec;
-        mAcceptor.cancel(ec);
-        mAcceptor.close(ec);
-    }
+    if (mTor) mTor->Stop();
+
+    CloseListeners();
 
     mCv.notify_all();
 
@@ -400,11 +541,8 @@ void ConnManager::Interrupt() {
         std::lock_guard<std::mutex> lock(mCvMutex);
         mRunning = false;
     }
-    {
-        boost::system::error_code ec;
-        mAcceptor.cancel(ec);
-        mAcceptor.close(ec);
-    }
+    if (mTor) mTor->Stop();
+    CloseListeners();
     mCv.notify_all();
     if (mWorkGuard) mWorkGuard->reset();
     mIO.stop();
@@ -413,95 +551,39 @@ void ConnManager::Interrupt() {
 void ConnManager::AcceptLoop() {
     while (mRunning) {
         try {
-            if (!mAcceptor.is_open()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            int maxFd = -1;
+            std::vector<size_t> open;
+            for (size_t i = 0; i < mListeners.size(); ++i) {
+                tcp::acceptor& a = *mListeners[i].acceptor;
+                if (!a.is_open()) continue;
+                FD_SET(a.native_handle(), &rfds);
+                const int fd = static_cast<int>(a.native_handle());
+                if (fd > maxFd) maxFd = fd;
+                open.push_back(i);
+            }
+            if (open.empty()) {
                 std::unique_lock<std::mutex> lock(mCvMutex);
                 mCv.wait_for(lock, std::chrono::seconds(1),
                              [this]() { return !mRunning; });
                 continue;
             }
 
-            int fd = static_cast<int>(mAcceptor.native_handle());
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(fd, &rfds);
             struct timeval tv = {0, 500000};  // 500 ms
-            int sel = select(fd + 1, &rfds,
+            int sel = select(maxFd + 1, &rfds,
                              nullptr, nullptr, &tv);
             if (!mRunning) break;
             if (sel <= 0) {
                 continue;
             }
-
-            auto node = std::make_shared<Node>(
-                mIO, GetNextNodeId(), true);
-            boost::system::error_code ec;
-            mAcceptor.accept(node->socket, ec);
-            if (ec) {
-                if (mRunning &&
-                    ec != boost::asio::error::would_block &&
-                    ec != boost::asio::error::try_again) {
-                    std::cerr << "ConnManager: "
-                                 "accept error: "
-                              << ec.message()
-                              << "\n";
-                }
-                continue;
-            }
-            node->socket.non_blocking(true, ec);
-            std::string ip = node->socket
-                .remote_endpoint(ec)
-                .address().to_string();
-            if (ec) continue;
-            const uint16_t remotePort =
-                node->socket.remote_endpoint(ec).port();
-            if (ec) continue;
-            if (IsIPBanned(ip)) {
-                std::cerr << "ConnManager: rejected"
-                             " banned " << ip << "\n";
-                boost::system::error_code closeEc;
-                node->socket.close(closeEc);
-                continue;
-            }
-            if (!CheckConnectionLimitForIP(ip)) {
-                boost::system::error_code closeEc;
-                node->socket.close(closeEc);
-                continue;
-            }
-            bool atCapacity = false;
-            {
-                std::lock_guard<std::mutex> lock(
-                    mNodesMutex);
-                atCapacity = mNodes.size() >= mOptions.maxConnections;
-            }
-
-            if (atCapacity) {
-                if (!EvictOneInboundPeer()) {
-                    MONEU_LOG_DEBUG("Connection slots full and no peer "
-                                    "worth evicting; refusing a connection");
-                    DecrementConnectionCount(ip);
-                    boost::system::error_code closeEc;
-                    node->socket.close(closeEc);
-                    continue;
+            for (size_t i : open) {
+                Listener& l = mListeners[i];
+                if (l.acceptor->is_open() &&
+                    FD_ISSET(l.acceptor->native_handle(), &rfds)) {
+                    AcceptOne(*l.acceptor, l.onion);
                 }
             }
-
-            {
-                std::lock_guard<std::mutex> lock(
-                    mNodesMutex);
-                node->addr.ip   = ip;
-                node->addr.port = remotePort;
-                node->connected = true;
-                node->connTime  = GetCurrentTimestamp();
-                mNodes[node->id] = node;
-            }
-            MONEU_LOG_INFO("New inbound peer connected: peer=" +
-                           std::to_string(node->id) +
-                           node::Log::PeerAddr(node->addr.ToString()));
-            StartHandshakeTimeout(node);
-            SendVersion(node);
-            StartRead(node);
-            if (mCallbacks.onNodeConnected)
-                mCallbacks.onNodeConnected(node->id);
         } catch (const std::exception& e) {
             std::cerr << "ConnManager: AcceptLoop "
                          "exception: "
@@ -510,30 +592,185 @@ void ConnManager::AcceptLoop() {
     }
 }
 
+bool ConnManager::BindListener(const NetAddress& addr, bool onion) {
+    boost::system::error_code ec;
+    const asio::ip::address ip = asio::ip::make_address(addr.ip, ec);
+    if (ec) return false;
+    std::unique_ptr<tcp::acceptor> acceptor(new tcp::acceptor(mIO));
+    try {
+        const tcp::endpoint endpoint(ip, addr.port);
+        acceptor->open(endpoint.protocol());
+        acceptor->set_option(asio::socket_base::reuse_address(true));
+        if (ip.is_v6()) acceptor->set_option(asio::ip::v6_only(true));
+        acceptor->bind(endpoint);
+        acceptor->listen();
+        acceptor->non_blocking(true);
+    } catch (const std::exception& e) {
+        std::cerr << "ConnManager: listen failed on "
+                  << addr.ToString() << ": " << e.what() << "\n";
+        if (onion) {
+            MONEU_LOG_WARN("P2P: cannot listen for onion connections on " +
+                           addr.ToString() + ": " + e.what());
+        } else {
+            MONEU_LOG_ERROR("P2P: cannot listen on " + addr.ToString() +
+                            ": " + e.what());
+        }
+        return false;
+    }
+    std::cerr << "ConnManager: listening on " << addr.ToString()
+              << (onion ? " for onion peers" : "") << "\n";
+    Listener l;
+    l.acceptor = std::move(acceptor);
+    l.onion    = onion;
+    mListeners.push_back(std::move(l));
+    return true;
+}
+
+void ConnManager::CloseListeners() {
+    for (auto& l : mListeners) {
+        boost::system::error_code ec;
+        l.acceptor->cancel(ec);
+        l.acceptor->close(ec);
+    }
+}
+
+void ConnManager::AcceptOne(tcp::acceptor& acceptor, bool onion) {
+    auto node = std::make_shared<Node>(
+        mIO, GetNextNodeId(), true);
+    node->onionInbound = onion;
+    boost::system::error_code ec;
+    acceptor.accept(node->socket, ec);
+    if (ec) {
+        if (mRunning &&
+            ec != boost::asio::error::would_block &&
+            ec != boost::asio::error::try_again) {
+            std::cerr << "ConnManager: "
+                         "accept error: "
+                      << ec.message()
+                      << "\n";
+        }
+        return;
+    }
+    node->socket.non_blocking(true, ec);
+    std::string ip = node->socket
+        .remote_endpoint(ec)
+        .address().to_string();
+    if (ec) return;
+    const uint16_t remotePort =
+        node->socket.remote_endpoint(ec).port();
+    if (ec) return;
+
+    if (!onion) {
+        if (IsIPBanned(ip)) {
+            std::cerr << "ConnManager: rejected"
+                         " banned " << ip << "\n";
+            boost::system::error_code closeEc;
+            node->socket.close(closeEc);
+            return;
+        }
+        if (!CheckConnectionLimitForIP(ip)) {
+            boost::system::error_code closeEc;
+            node->socket.close(closeEc);
+            return;
+        }
+    }
+    bool atCapacity = false;
+    {
+        std::lock_guard<std::mutex> lock(
+            mNodesMutex);
+        atCapacity = mNodes.size() >= mOptions.maxConnections;
+    }
+
+    if (atCapacity) {
+        if (!EvictOneInboundPeer()) {
+            MONEU_LOG_DEBUG("Connection slots full and no peer "
+                            "worth evicting; refusing a connection");
+            if (!onion) DecrementConnectionCount(ip);
+            boost::system::error_code closeEc;
+            node->socket.close(closeEc);
+            return;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(
+            mNodesMutex);
+        node->addr.ip   = ip;
+        node->addr.port = remotePort;
+        node->connected = true;
+        node->connTime  = GetCurrentTimestamp();
+        mNodes[node->id] = node;
+    }
+    MONEU_LOG_INFO(std::string(onion ? "New inbound onion peer connected: peer="
+                                     : "New inbound peer connected: peer=") +
+                   std::to_string(node->id) +
+                   (onion ? std::string()
+                          : node::Log::PeerAddr(node->addr.ToString())));
+    StartHandshakeTimeout(node);
+    SendVersion(node);
+    StartRead(node);
+    if (mCallbacks.onNodeConnected)
+        mCallbacks.onNodeConnected(node->id);
+}
+
 void ConnManager::ConnectLoop() {
+    static const int64_t RETRY_SEC = 10 * 60;
+    bool firstPass = true;
+    std::map<std::string, int64_t> lastTry;
     while (mRunning) {
-        {
+        if (!firstPass) {
             std::unique_lock<std::mutex> lock(mCvMutex);
             mCv.wait_for(lock, std::chrono::seconds(30),
                          [this]() { return !mRunning; });
         }
+        firstPass = false;
         if (!mRunning) break;
         if (!mNetworkActive) continue;
         size_t outbound = GetOutboundCount();
         if (outbound >= mOptions.maxOutbound) continue;
+
         std::vector<NetAddress> candidates;
+        std::vector<NetAddress> learned;
         {
-            std::lock_guard<std::mutex> lock(
-                mAddrMutex);
-            candidates = mKnownAddresses;
+            std::lock_guard<std::mutex> lock(mAddrMutex);
+            candidates = mOperatorAddresses;
+            candidates.insert(candidates.end(),
+                              mSeedAddresses.begin(), mSeedAddresses.end());
+            learned = mKnownAddresses;
         }
-        for (const auto& addr : candidates) {
+        std::stable_sort(learned.begin(), learned.end(),
+                         [](const NetAddress& x, const NetAddress& y) {
+                             return x.lastSeen > y.lastSeen;
+                         });
+        candidates.insert(candidates.end(), learned.begin(), learned.end());
+
+        const int64_t now = GetCurrentTimestamp();
+        for (auto it = lastTry.begin(); it != lastTry.end();) {
+            if (now - it->second >= RETRY_SEC) it = lastTry.erase(it);
+            else ++it;
+        }
+
+        const size_t fixedCount = candidates.size() - learned.size();
+        std::set<std::string> tried;
+        size_t attempts = 0;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const NetAddress& addr = candidates[i];
             if (outbound >= mOptions.maxOutbound) break;
             if (!mRunning) break;
+            if (attempts >= MAX_CONNECT_ATTEMPTS_PER_PASS) break;
+            const std::string key = addr.ToString();
+            if (!tried.insert(key).second) continue;
+            if (IsOwnAddress(addr)) continue;
+            if (IsIPBanned(addr.ip)) continue;
+            if (!IsReachable(addr.ip)) continue;
+            if (IsAlreadyConnected(addr)) continue;
+            if (i >= fixedCount && lastTry.count(key)) continue;
             const std::string group = GetGroup16(addr);
             if (CountOutboundInGroup(group) >= MAX_OUTBOUND_PER_GROUP) {
                 continue;
             }
+            ++attempts;
+            lastTry[key] = GetCurrentTimestamp();
             if (ConnectToAddress(addr)) outbound++;
         }
     }
@@ -551,113 +788,182 @@ bool ConnManager::IsAlreadyConnected(const NetAddress& addr) const {
     return false;
 }
 
+bool ConnManager::ConnectSocket(NodePtr node, const tcp::endpoint& endpoint) {
+    boost::system::error_code ec;
+    node->socket.close(ec);
+
+    node->socket.open(endpoint.protocol(), ec);
+    if (ec) return false;
+
+    node->socket.non_blocking(true, ec);
+    if (ec) return false;
+
+    // The connect goes through the socket directly rather than through
+    // asio. Asio's synchronous connect polls with no timeout of its own,
+    // so it returns only once the kernel gives up resending the first
+    // packet, which takes over two minutes. The loop below never got a
+    // turn, and with it the check on mRunning: a shutdown waited out
+    // those two minutes, and during ordinary work one address nobody
+    // answers held up every other address behind it.
+    {
+        const int rc = ::connect(node->socket.native_handle(),
+                                 endpoint.data(),
+                                 endpoint.size());
+        if (rc == 0) {
+            ec = boost::system::error_code();
+        } else {
+#ifdef WIN32
+            const int wsaErr = ::WSAGetLastError();
+            ec = boost::system::error_code(
+                wsaErr == WSAEWOULDBLOCK ? EINPROGRESS : wsaErr,
+                boost::system::system_category());
+#else
+            ec = boost::system::error_code(
+                errno, boost::system::system_category());
+#endif
+        }
+    }
+
+    if (!ec) return true;
+    if (ec.value() != EINPROGRESS && ec.value() != EWOULDBLOCK &&
+        ec.value() != EAGAIN) {
+        return false;
+    }
+
+    const int64_t deadline = GetCurrentTimestamp() + CONNECT_TIMEOUT_SEC;
+    while (mRunning) {
+        if (GetCurrentTimestamp() >= deadline) return false;
+
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(node->socket.native_handle(), &wfds);
+        struct timeval tv = {0, 500000};  // 500ms
+#ifdef WIN32
+        fd_set efds;
+        FD_ZERO(&efds);
+        FD_SET(node->socket.native_handle(), &efds);
+        int sel = select(0, nullptr, &wfds, &efds, &tv);
+#else
+        int sel = select(node->socket.native_handle() + 1,
+                         nullptr, &wfds, nullptr, &tv);
+#endif
+        if (sel > 0) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            getsockopt(node->socket.native_handle(),
+                       SOL_SOCKET, SO_ERROR,
+                       (char*)&err, &len);
+            return err == 0;
+        } else if (sel < 0) {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool ConnManager::ConnectThroughProxy(NodePtr node, const NetAddress& proxy,
+                                      const NetAddress& addr) {
+    boost::system::error_code ec;
+    const asio::ip::address proxyIp = asio::ip::make_address(proxy.ip, ec);
+    if (ec) return false;
+    if (!ConnectSocket(node, tcp::endpoint(proxyIp, proxy.port))) {
+        MONEU_LOG_DEBUG("P2P: cannot reach proxy " + proxy.ToString());
+        return false;
+    }
+
+    ProxyCredentials creds;
+    const ProxyCredentials* auth = nullptr;
+    if (mOptions.proxyRandomize) {
+        uint8_t r[16];
+        random_buffer(r, sizeof(r));
+        static const char* hexDigits = "0123456789abcdef";
+        for (int i = 0; i < 8; ++i) {
+            creds.username.push_back(hexDigits[(r[i] >> 4) & 0x0F]);
+            creds.username.push_back(hexDigits[r[i] & 0x0F]);
+            creds.password.push_back(hexDigits[(r[i + 8] >> 4) & 0x0F]);
+            creds.password.push_back(hexDigits[r[i + 8] & 0x0F]);
+        }
+        auth = &creds;
+    }
+
+    std::string err;
+    if (!Socks5(node->socket.native_handle(), addr.ip, addr.port, auth,
+                SOCKS5_RECV_TIMEOUT_MS, mRunning, err)) {
+        MONEU_LOG_DEBUG("P2P: connection through proxy failed: " + err +
+                        node::Log::PeerAddr(addr.ToString()));
+        return false;
+    }
+    return true;
+}
+
+bool ConnManager::GetProxyFor(NetKind kind, NetAddress& out) const {
+    std::lock_guard<std::mutex> lock(mProxyMutex);
+    if (kind == NetKind::ONION) {
+        if (!mHaveOnionProxy) return false;
+        out = mOnionProxy;
+        return true;
+    }
+    if (!mHaveProxy) return false;
+    out = mProxy;
+    return true;
+}
+
+bool ConnManager::IsReachableKind(NetKind kind) const {
+    switch (kind) {
+        case NetKind::IPV4:
+            return mReachIPv4;
+        case NetKind::IPV6:
+            return mReachIPv6;
+        case NetKind::ONION: {
+            std::lock_guard<std::mutex> lock(mProxyMutex);
+            return mReachOnion && mHaveOnionProxy;
+        }
+        case NetKind::NAME: {
+            std::lock_guard<std::mutex> lock(mProxyMutex);
+            return mHaveProxy || mOptions.onlyNets.empty();
+        }
+        default:
+            return false;
+    }
+}
+
+bool ConnManager::IsReachable(const std::string& host) const {
+    return IsReachableKind(Classify(host));
+}
+
 bool ConnManager::ConnectToAddress(const NetAddress& addr) {
     if (IsOwnAddress(addr)) return false;
     if (IsIPBanned(addr.ip)) return false;
+    const NetKind kind = Classify(addr.ip);
+    if (!IsReachableKind(kind)) return false;
     mAddrMan.Attempt(addr.ip, addr.port, GetCurrentTimestamp());
     if (IsAlreadyConnected(addr)) return false;
     if (!CheckConnectionLimitForIP(addr.ip)) return false;
 
     auto node = std::make_shared<Node>(mIO, GetNextNodeId(), false);
 
-    tcp::resolver resolver(mIO);
-    boost::system::error_code ec;
-    auto endpoints = resolver.resolve(addr.ip, std::to_string(addr.port), ec);
-    if (ec) {
-        std::cerr << "ConnManager: outbound address "
-                     "resolve failed: " << ec.message() << "\n";
-        DecrementConnectionCount(addr.ip);
-        return false;
-    }
-
     bool connected = false;
-    for (auto it = endpoints.begin(); it != endpoints.end(); ++it) {
-        ec = boost::system::error_code();
-        node->socket.close(ec);
-
-        node->socket.open(it->endpoint().protocol(), ec);
-        if (ec) continue;
-
-        node->socket.non_blocking(true, ec);
-        if (ec) continue;
-
-        // The connect goes through the socket directly rather than through
-        // asio. Asio's synchronous connect polls with no timeout of its own,
-        // so it returns only once the kernel gives up resending the first
-        // packet, which takes over two minutes. The loop below never got a
-        // turn, and with it the check on mRunning: a shutdown waited out
-        // those two minutes, and during ordinary work one address nobody
-        // answers held up every other address behind it.
-        {
-            const int rc = ::connect(node->socket.native_handle(),
-                                     it->endpoint().data(),
-                                     it->endpoint().size());
-            if (rc == 0) {
-                ec = boost::system::error_code();
-            } else {
-#ifdef WIN32
-                const int wsaErr = ::WSAGetLastError();
-                ec = boost::system::error_code(
-                    wsaErr == WSAEWOULDBLOCK ? EINPROGRESS : wsaErr,
-                    boost::system::system_category());
-#else
-                ec = boost::system::error_code(
-                    errno, boost::system::system_category());
-#endif
-            }
+    NetAddress proxy;
+    if (GetProxyFor(kind, proxy)) {
+        node->viaProxy = true;
+        connected = ConnectThroughProxy(node, proxy, addr);
+    } else if (kind != NetKind::ONION) {
+        tcp::resolver resolver(mIO);
+        boost::system::error_code ec;
+        auto endpoints = resolver.resolve(addr.ip, std::to_string(addr.port), ec);
+        if (ec) {
+            std::cerr << "ConnManager: outbound address "
+                         "resolve failed: " << ec.message() << "\n";
+            DecrementConnectionCount(addr.ip);
+            return false;
         }
-
-        if (ec.value() == EINPROGRESS || ec.value() == EWOULDBLOCK ||
-            ec.value() == EAGAIN) {
-            // Half a second at a time, so that a shutdown is noticed at
-            // once, and no more than CONNECT_TIMEOUT_SEC in total, so that
-            // an address nobody answers does not hold up the ones behind it.
-            const int64_t deadline =
-                GetCurrentTimestamp() + CONNECT_TIMEOUT_SEC;
-
-            while (!connected && mRunning) {
-                if (GetCurrentTimestamp() >= deadline) break;
-
-                fd_set wfds;
-                FD_ZERO(&wfds);
-                FD_SET(node->socket.native_handle(), &wfds);
-                struct timeval tv = {0, 500000};  // 500ms
-#ifdef WIN32
-                fd_set efds;
-                FD_ZERO(&efds);
-                FD_SET(node->socket.native_handle(), &efds);
-                int sel = select(0, nullptr, &wfds, &efds, &tv);
-#else
-                int sel = select(node->socket.native_handle() + 1,
-                                 nullptr, &wfds, nullptr, &tv);
-#endif
-                if (sel > 0) {
-                    boost::system::error_code ec2;
-                    node->socket.non_blocking(false, ec2);
-                    int err = 0;
-                    socklen_t len = sizeof(err);
-                    getsockopt(node->socket.native_handle(),
-                               SOL_SOCKET, SO_ERROR,
-                               (char*)&err, &len);
-                    if (err == 0) {
-                        connected = true;
-                    }
-#ifdef WIN32
-                    else {
-                        break;
-                    }
-#endif
-                } else if (sel == 0) {
-                } else {
-                    break;
-                }
-            }
-        } else if (!ec) {
-            connected = true;
+        for (auto it = endpoints.begin();
+             it != endpoints.end() && !connected && mRunning; ++it) {
+            connected = ConnectSocket(node, it->endpoint());
         }
-        if (connected) break;
     }
 
+    boost::system::error_code ec;
     node->socket.non_blocking(true, ec);
 
     if (!connected || !mRunning) {
@@ -1137,6 +1443,9 @@ void ConnManager::HandleBlock(
 
         node->lastNovelBlock = GetCurrentTimestamp();
 
+        const uint32_t blockHeight = block.GetHeader().GetHeight();
+        if (blockHeight > node->bestHeight) node->bestHeight = blockHeight;
+
         const bytes32 parentHash = block.GetHeader().GetPrevBlockHash();
         if (mCallbacks.haveBlock && !mCallbacks.haveBlock(parentHash)) {
             ReRequestStalledParent(node, parentHash);
@@ -1452,6 +1761,8 @@ bool ConnManager::EvictOneInboundPeer() {
         int64_t     minPing;
         int64_t     lastBlock;
         int64_t     lastTx;
+        bool        onion;
+        bool        local;
     };
 
     std::vector<Candidate> candidates;
@@ -1473,6 +1784,11 @@ bool ConnManager::EvictOneInboundPeer() {
                           : 0x7FFFFFFFFFFFFFFFLL;
             c.lastBlock = n->lastNovelBlock;
             c.lastTx    = n->lastNovelTx;
+            c.onion     = n->onionInbound;
+            c.local     = !n->onionInbound &&
+                          (n->addr.ip.compare(0, 4, "127.") == 0 ||
+                           n->addr.ip == "::1" ||
+                           n->addr.ip.compare(0, 11, "::ffff:127.") == 0);
             candidates.push_back(c);
         }
     }
@@ -1510,8 +1826,57 @@ bool ConnManager::EvictOneInboundPeer() {
     if (candidates.empty()) return false;
 
     {
-        const size_t protectByAge = candidates.size() / 2;
-        protectBest(protectByAge,
+        const size_t totalProtect = candidates.size() / 2;
+        const size_t maxByNetwork = totalProtect / 2;
+        size_t protectedCount = 0;
+
+        struct Net { bool onion; size_t count; };
+        Net nets[2] = {{false, 0}, {true, 0}};
+        auto inNet = [](const Candidate& c, const Net& n) {
+            return n.onion ? c.onion : c.local;
+        };
+        for (Net& n : nets) {
+            for (const Candidate& c : candidates) {
+                if (inNet(c, n)) n.count++;
+            }
+        }
+        if (nets[1].count < nets[0].count) std::swap(nets[0], nets[1]);
+
+        while (protectedCount < maxByNetwork) {
+            const size_t numNets = (nets[0].count ? 1 : 0) +
+                                   (nets[1].count ? 1 : 0);
+            if (numNets == 0) break;
+            const size_t perNet =
+                std::max((maxByNetwork - protectedCount) / numNets,
+                         static_cast<size_t>(1));
+            bool protectedAny = false;
+            for (Net& n : nets) {
+                if (n.count == 0) continue;
+                std::vector<size_t> members;
+                for (size_t i = 0; i < candidates.size(); ++i) {
+                    if (inNet(candidates[i], n)) members.push_back(i);
+                }
+                std::sort(members.begin(), members.end(),
+                          [&candidates](size_t x, size_t y) {
+                              return candidates[x].connTime <
+                                     candidates[y].connTime;
+                          });
+                const size_t k = std::min(perNet, members.size());
+                if (k == 0) continue;
+                members.resize(k);
+                std::sort(members.begin(), members.end());
+                for (size_t j = k; j-- > 0; ) {
+                    candidates.erase(candidates.begin() + members[j]);
+                }
+                protectedAny = true;
+                protectedCount += k;
+                if (protectedCount >= maxByNetwork) break;
+                n.count -= k;
+            }
+            if (!protectedAny) break;
+        }
+
+        protectBest(totalProtect - protectedCount,
                     [](const Candidate& a, const Candidate& b) {
                         return a.connTime < b.connTime;
                     });
@@ -1670,6 +2035,18 @@ void ConnManager::CheckDownloadProgress() {
             mStallingSince.erase(toDrop[i].first);
             continue;
         }
+        if (CountFullyConnected() <= 1) {
+            MONEU_LOG_INFO("Peer=" + std::to_string(toDrop[i].first) + " " +
+                           toDrop[i].second + ", but it is the only peer - "
+                           "keeping it and asking again");
+            ClearInFlightForPeer(toDrop[i].first);
+            {
+                std::lock_guard<std::mutex> lock(mInFlightMutex);
+                mStallingSince.erase(toDrop[i].first);
+            }
+            RequestBlocksFrom(toDrop[i].first);
+            continue;
+        }
         MONEU_LOG_INFO("Peer=" + std::to_string(toDrop[i].first) + " " +
                        toDrop[i].second + ", disconnecting - its blocks go "
                        "to other peers");
@@ -1766,16 +2143,28 @@ void ConnManager::SyncFromAllPeers() {
     bytes32 ourTip;
     if (!mCallbacks.getChainTip(ourHeight, ourTip)) return;
 
+    const int64_t now = GetCurrentTimestamp();
+    const bool stale = now - mLastTipChange >= STALE_TIP_SEC &&
+                       now - mLastStaleProbe >= STALE_TIP_SEC;
+    if (stale) mLastStaleProbe = now;
+
     std::vector<NodeId> behindUs;
     {
         std::lock_guard<std::mutex> lock(mNodesMutex);
         for (const auto& pair : mNodes) {
             const NodePtr& n = pair.second;
             if (!n || !n->IsFullyConnected()) continue;
-            if (n->bestHeight > ourHeight) behindUs.push_back(n->id);
+            if (stale || n->bestHeight > ourHeight) behindUs.push_back(n->id);
         }
     }
     if (behindUs.empty()) return;
+
+    if (stale) {
+        MONEU_LOG_INFO("Sync check: no new block for " +
+                       std::to_string((now - mLastTipChange) / 60) +
+                       " minutes, asking " + std::to_string(behindUs.size()) +
+                       " peer(s)");
+    }
 
     MONEU_LOG_DEBUG("Sync check: at height " + std::to_string(ourHeight) +
                     ", " + std::to_string(behindUs.size()) +
@@ -1965,9 +2354,22 @@ void ConnManager::MessageLoop() {
 
 void ConnManager::SetExternalAddress(const std::string& ip,
                                      uint16_t port) {
+    {
+        std::lock_guard<std::mutex> lock(mAddrMutex);
+        mExternalAddresses.clear();
+    }
+    AddExternalAddress(ip, port);
+}
+
+void ConnManager::AddExternalAddress(const std::string& ip,
+                                     uint16_t port) {
     std::lock_guard<std::mutex> lock(mAddrMutex);
-    mExternalAddress = NetAddress(ip, port);
-    mExternalAddress.lastSeen = GetCurrentTimestamp();
+    for (const auto& a : mExternalAddresses) {
+        if (a.ip == ip && a.port == port) return;
+    }
+    NetAddress a(ip, port);
+    a.lastSeen = GetCurrentTimestamp();
+    mExternalAddresses.push_back(a);
 }
 
 namespace {
@@ -1986,7 +2388,116 @@ bool ParseIPv4(const std::string& ip, int out[4]) {
 
 }
 
+bool ConnManager::IsOnionAddress(const std::string& host) {
+    static const std::string suffix = ".onion";
+    if (host.size() != 56 + suffix.size()) return false;
+    if (host.compare(56, suffix.size(), suffix) != 0) return false;
+
+    uint8_t raw[35];
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t out = 0;
+    for (size_t i = 0; i < 56; ++i) {
+        const char c = host[i];
+        int v;
+        if (c >= 'a' && c <= 'z') {
+            v = c - 'a';
+        } else if (c >= '2' && c <= '7') {
+            v = c - '2' + 26;
+        } else {
+            return false;
+        }
+        acc = (acc << 5) | static_cast<uint32_t>(v);
+        bits += 5;
+        if (bits >= 8) {
+            bits -= 8;
+            raw[out++] = static_cast<uint8_t>((acc >> bits) & 0xFF);
+        }
+    }
+    if (out != sizeof(raw)) return false;
+    if (raw[34] != 3) return false;
+
+    static const unsigned char prefix[] = ".onion checksum";
+    unsigned char sum[SHA3_256::OUTPUT_SIZE];
+    SHA3_256 hasher;
+    hasher.Write(prefix, sizeof(prefix) - 1);
+    hasher.Write(raw, 32);
+    hasher.Write(raw + 34, 1);
+    hasher.Finalize(sum);
+    return sum[0] == raw[32] && sum[1] == raw[33];
+}
+
+NetKind ConnManager::Classify(const std::string& host) {
+    if (host.empty() || host.size() > 255) return NetKind::INVALID;
+    if (IsOnionAddress(host)) return NetKind::ONION;
+    int o[4];
+    if (ParseIPv4(host, o)) return NetKind::IPV4;
+    boost::system::error_code ec;
+    asio::ip::make_address_v6(host, ec);
+    if (!ec) return NetKind::IPV6;
+    if (host.size() >= 6 && host.compare(host.size() - 6, 6, ".onion") == 0) {
+        return NetKind::INVALID;
+    }
+    bool letter = false;
+    for (char c : host) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            letter = true;
+        } else if (!((c >= '0' && c <= '9') || c == '.' || c == '-')) {
+            return NetKind::INVALID;
+        }
+    }
+    return letter ? NetKind::NAME : NetKind::INVALID;
+}
+
+bool ConnManager::ParseHostPort(const std::string& in, uint16_t defaultPort,
+                                NetAddress& out) {
+    std::string host;
+    uint16_t port = defaultPort;
+    if (in.empty()) return false;
+    if (in[0] == '[') {
+        const size_t close = in.find(']');
+        if (close == std::string::npos) return false;
+        host = in.substr(1, close - 1);
+        if (close + 1 < in.size()) {
+            if (in[close + 1] != ':') return false;
+            try {
+                const unsigned long p = std::stoul(in.substr(close + 2));
+                if (p == 0 || p > 65535) return false;
+                port = static_cast<uint16_t>(p);
+            } catch (const std::exception&) {
+                return false;
+            }
+        }
+    } else if (std::count(in.begin(), in.end(), ':') == 1) {
+        const size_t colon = in.rfind(':');
+        host = in.substr(0, colon);
+        try {
+            const unsigned long p = std::stoul(in.substr(colon + 1));
+            if (p == 0 || p > 65535) return false;
+            port = static_cast<uint16_t>(p);
+        } catch (const std::exception&) {
+            return false;
+        }
+    } else {
+        host = in;
+    }
+    if (host == "localhost") host = "127.0.0.1";
+    if (host.size() > 6) {
+        std::string lower;
+        for (char c : host) lower.push_back(static_cast<char>(std::tolower(
+            static_cast<unsigned char>(c))));
+        if (lower.compare(lower.size() - 6, 6, ".onion") == 0) host = lower;
+    }
+    if (Classify(host) == NetKind::INVALID) {
+        int o[4];
+        if (!ParseIPv4(host, o)) return false;
+    }
+    out = NetAddress(host, port);
+    return true;
+}
+
 bool ConnManager::IsPrivateAddress(const std::string& ip) {
+    if (IsOnionAddress(ip)) return false;
     int o[4];
     if (ParseIPv4(ip, o)) {
         if (o[0] == 10) return true;
@@ -2016,7 +2527,11 @@ bool ConnManager::IsUsableAddress(const std::string& ip) {
         if (o[0] == 127) return false;
         return true;
     }
-    return true;
+    if (IsOnionAddress(ip)) return true;
+
+    boost::system::error_code ec;
+    asio::ip::make_address_v6(ip, ec);
+    return !ec;
 }
 
 bool ConnManager::IsRelayableAddress(const std::string& ip) {
@@ -2039,6 +2554,8 @@ int ConnManager::ReachabilityScore(const std::string& local,
                                    const std::string& peer) {
     if (!IsUsableAddress(local)) return 0;
 
+    if (IsOnionAddress(local)) return IsOnionAddress(peer) ? 5 : 1;
+
     const bool localPrivate = IsPrivateAddress(local);
     const bool peerPrivate  = IsPrivateAddress(peer);
 
@@ -2054,7 +2571,9 @@ void ConnManager::DiscoverLocalAddresses() {
 
     {
         std::lock_guard<std::mutex> lock(mAddrMutex);
-        if (!mExternalAddress.ip.empty()) found.push_back(mExternalAddress);
+        for (const auto& e : mExternalAddresses) {
+            if (!e.ip.empty()) found.push_back(e);
+        }
     }
 
 #ifdef WIN32
@@ -2178,10 +2697,11 @@ bool ConnManager::IsOwnAddress(const NetAddress& addr) const {
 
     {
         std::lock_guard<std::mutex> lock(mAddrMutex);
-        if (!mExternalAddress.ip.empty() &&
-            mExternalAddress.ip == addr.ip &&
-            (mExternalAddress.port == addr.port || addr.port == 0)) {
-            return true;
+        for (const auto& e : mExternalAddresses) {
+            if (!e.ip.empty() && e.ip == addr.ip &&
+                (e.port == addr.port || addr.port == 0)) {
+                return true;
+            }
         }
     }
 
@@ -2210,7 +2730,23 @@ bool ConnManager::SelectLocalAddressFor(const NetAddress& peer,
 
 void ConnManager::AdvertiseSelf(NodePtr node) {
     NetAddress self;
-    if (!SelectLocalAddressFor(node->addr, self)) {
+    if (node->onionInbound) {
+        const std::string onion = GetOnionService();
+        if (!onion.empty()) {
+            self = NetAddress(onion, NetParams::DEFAULT_PORT);
+        } else {
+            std::lock_guard<std::mutex> lock(mAddrMutex);
+            bool found = false;
+            for (const auto& e : mExternalAddresses) {
+                if (IsOnionAddress(e.ip)) {
+                    self = e;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return;
+        }
+    } else if (!SelectLocalAddressFor(node->addr, self)) {
         return;
     }
     self.lastSeen = static_cast<uint64_t>(GetCurrentTimestamp());
@@ -2232,9 +2768,20 @@ size_t ConnManager::BootstrapFromSeeds() {
         std::string ip = entry.substr(0, colon);
         int port = std::atoi(entry.c_str() + colon + 1);
         if (ip.empty() || port <= 0 || port > 65535) continue;
-        AddKnownAddress(NetAddress(ip, static_cast<uint16_t>(port)));
+        const NetAddress seed(ip, static_cast<uint16_t>(port));
+        AddKnownAddress(seed);
+        {
+            std::lock_guard<std::mutex> lock(mAddrMutex);
+            bool listed = false;
+            for (const auto& a : mSeedAddresses) {
+                if (a.ip == seed.ip && a.port == seed.port) listed = true;
+            }
+            if (!listed) mSeedAddresses.push_back(seed);
+        }
         added++;
     }
+
+    if (mHaveProxy) return added;
 
     for (const auto& host : NetParams::GetDNSSeeds()) {
         try {
@@ -2363,7 +2910,7 @@ void ConnManager::DisconnectNode(
     node->socket.shutdown(
         tcp::socket::shutdown_both, ec);
     node->socket.close(ec);
-    DecrementConnectionCount(node->addr.ip);
+    if (!node->onionInbound) DecrementConnectionCount(node->addr.ip);
     if (mCallbacks.onNodeDisconnected)
         mCallbacks.onNodeDisconnected(node->id);
     RemoveNode(node->id);
@@ -2382,7 +2929,18 @@ bool ConnManager::AddKnownAddress(
 
 void ConnManager::AddOperatorAddress(const NetAddress& addr) {
     if (addr.ip.empty() || addr.port == 0) return;
-    if (!IsUsableAddress(addr.ip)) return;
+    const NetKind kind = Classify(addr.ip);
+    if (kind == NetKind::INVALID) return;
+
+    {
+        std::lock_guard<std::mutex> lock(mAddrMutex);
+        bool listed = false;
+        for (const auto& a : mOperatorAddresses) {
+            if (a.ip == addr.ip && a.port == addr.port) listed = true;
+        }
+        if (!listed) mOperatorAddresses.push_back(addr);
+    }
+    if (kind == NetKind::NAME || !IsUsableAddress(addr.ip)) return;
 
     const int64_t now = GetCurrentTimestamp();
     mAddrMan.Add(addr.ip, addr.port, addr.services, addr.ip, now);
@@ -2452,6 +3010,14 @@ bool ConnManager::IsIPBanned(
 bool ConnManager::AddNode(
     const std::string& addrStr)
 {
+    {
+        NetAddress parsed;
+        if (ParseHostPort(addrStr, mOptions.listenPort, parsed)) {
+            AddOperatorAddress(parsed);
+            return ConnectToAddress(parsed);
+        }
+    }
+
     std::string ip;
     uint16_t port = mOptions.listenPort;
 
@@ -2549,19 +3115,6 @@ void ConnManager::BroadcastBlock(
     for (auto& pair : mNodes) {
         if (!pair.second->IsFullyConnected())
             continue;
-        {
-            std::lock_guard<std::mutex> qlock(
-                pair.second->sendMutex);
-            if (pair.second->sendQueue.size() >
-                MAX_QUEUE_PER_NODE)
-            {
-                std::cerr << "ConnManager: node "
-                          << pair.second->addr
-                                 .ToString()
-                          << " queue saturated\n";
-                continue;
-            }
-        }
         pair.second->PushMessage(msg);
     }
 }
@@ -2632,6 +3185,8 @@ size_t ConnManager::GetOutboundCount() const {
 std::string ConnManager::GetGroup16(const NetAddress& addr) {
     const std::string& ip = addr.ip;
     if (ip.empty()) return std::string();
+
+    if (IsOnionAddress(ip)) return "onion:" + ip.substr(0, 1);
 
     size_t o1 = ip.find('.');
     if (o1 == std::string::npos) return std::string();
@@ -2755,9 +3310,80 @@ void ConnManager::UpdateBestChain(
     uint64_t round,
     const bytes32& blockHash)
 {
+    if (!(blockHash == mOptions.bestBlockHash)) {
+        mLastTipChange = GetCurrentTimestamp();
+    }
     mOptions.bestHeight    = height;
     mOptions.bestRound     = round;
     mOptions.bestBlockHash = blockHash;
+}
+
+size_t ConnManager::CountFullyConnected() const {
+    std::lock_guard<std::mutex> lock(mNodesMutex);
+    size_t count = 0;
+    for (const auto& pair : mNodes) {
+        if (pair.second && pair.second->IsFullyConnected()) count++;
+    }
+    return count;
+}
+
+void ConnManager::UseDefaultOnionProxy() {
+    std::lock_guard<std::mutex> lock(mProxyMutex);
+    if (mHaveOnionProxy) return;
+    mOnionProxy     = NetAddress("127.0.0.1", 9050);
+    mHaveOnionProxy = true;
+    MONEU_LOG_INFO("P2P: onion peers reachable through 127.0.0.1:9050");
+}
+
+void ConnManager::OnOnionService(const std::string& host) {
+    const NetAddress self(host, NetParams::DEFAULT_PORT);
+    {
+        std::lock_guard<std::mutex> lock(mLocalAddrMutex);
+        bool listed = false;
+        for (const auto& a : mLocalAddresses) {
+            if (a.ip == host) listed = true;
+        }
+        if (!listed) mLocalAddresses.push_back(self);
+        mOnionService = host;
+    }
+
+    std::vector<NodePtr> nodes;
+    {
+        std::lock_guard<std::mutex> lock(mNodesMutex);
+        for (auto& pair : mNodes) {
+            if (pair.second && pair.second->IsFullyConnected()) {
+                nodes.push_back(pair.second);
+            }
+        }
+    }
+    for (auto& node : nodes) AdvertiseSelf(node);
+}
+
+void ConnManager::OnOnionServiceLost(const std::string& host) {
+    std::lock_guard<std::mutex> lock(mLocalAddrMutex);
+    for (auto it = mLocalAddresses.begin(); it != mLocalAddresses.end(); ) {
+        if (it->ip == host) {
+            it = mLocalAddresses.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (mOnionService == host) mOnionService.clear();
+}
+
+std::string ConnManager::GetProxyString() const {
+    std::lock_guard<std::mutex> lock(mProxyMutex);
+    return mHaveProxy ? mProxy.ToString() : std::string();
+}
+
+std::string ConnManager::GetOnionProxyString() const {
+    std::lock_guard<std::mutex> lock(mProxyMutex);
+    return mHaveOnionProxy ? mOnionProxy.ToString() : std::string();
+}
+
+std::string ConnManager::GetOnionService() const {
+    std::lock_guard<std::mutex> lock(mLocalAddrMutex);
+    return mOnionService;
 }
 
 uint64_t ConnManager::GetTotalBytesRecv() const {

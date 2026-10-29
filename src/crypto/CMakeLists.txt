@@ -6,6 +6,7 @@ add_library(moneu_crypto STATIC
     hmac.c
     pbkdf2.c
     secure_enc.cpp
+    sha3_256.cpp
     memzero.c
     rand.c
     ed25519-donna/ed25519.c

@@ -129,8 +129,30 @@ void Config::ApplyNetworkValues() {
     );
     mNetwork.listen = GetBoolValue("listen", true);
     mNetwork.upnp   = GetBoolValue("upnp", false);
-    mNetwork.portMap = GetBoolValue("portmap", true);
+    mNetwork.proxy      = GetValue("proxy", "");
+    mNetwork.onionProxy = GetValue("onion", "");
+    mNetwork.proxyRandomize = GetBoolValue("proxyrandomize", true);
+    mNetwork.onlyNets.clear();
+    const std::vector<std::string> onlyNets = GetListValues("onlynet");
+    for (size_t i = 0; i < onlyNets.size(); ++i) {
+        if (!onlyNets[i].empty()) mNetwork.onlyNets.push_back(onlyNets[i]);
+    }
+    mNetwork.portMap  = GetBoolValue("portmap", mNetwork.proxy.empty());
+    mNetwork.discover = GetBoolValue("discover", mNetwork.proxy.empty());
+    mNetwork.listenOnion = GetBoolValue("listenonion", true);
+    mNetwork.torControl  = GetValue("torcontrol", "127.0.0.1:9051");
+    mNetwork.torPassword = GetValue("torpassword", "");
+    mNetwork.binds.clear();
+    const std::vector<std::string> binds = GetListValues("bind");
+    for (size_t i = 0; i < binds.size(); ++i) {
+        if (!binds[i].empty()) mNetwork.binds.push_back(binds[i]);
+    }
     mNetwork.externalIp = GetValue("externalip", "");
+    mNetwork.externalIps.clear();
+    const std::vector<std::string> externalIps = GetListValues("externalip");
+    for (size_t i = 0; i < externalIps.size(); ++i) {
+        if (!externalIps[i].empty()) mNetwork.externalIps.push_back(externalIps[i]);
+    }
     const std::vector<std::string> addNodes = GetListValues("addnode");
     for (size_t i = 0; i < addNodes.size(); ++i) {
         if (!addNodes[i].empty()) mNetwork.addNodes.push_back(addNodes[i]);
@@ -221,7 +243,9 @@ void Config::ApplyLogValues() {
 namespace {
 bool IsListKey(const std::string& key) {
     return key == "addnode" || key == "connect" ||
-           key == "rpcallowip" || key == "seednode";
+           key == "rpcallowip" || key == "seednode" ||
+           key == "onlynet" || key == "bind" ||
+           key == "externalip";
 }
 }
 
@@ -296,6 +320,10 @@ void Config::PrintConfig() const {
     std::cerr << "  maxinbound:     " << mNetwork.maxInbound     << "\n";
     std::cerr << "  listen:         " << mNetwork.listen         << "\n";
     std::cerr << "  portmap:        " << mNetwork.portMap        << "\n";
+    std::cerr << "  proxy:          "
+              << (mNetwork.proxy.empty() ? std::string("(none)") : mNetwork.proxy)
+              << "\n";
+    std::cerr << "  listenonion:    " << mNetwork.listenOnion    << "\n";
     std::cerr << "Mining:\n";
     std::cerr << "  enabled:        " << mMining.enabled << "\n";
     std::cerr << "  reward address: "

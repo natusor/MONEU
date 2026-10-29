@@ -43,9 +43,20 @@ struct NetworkConfig {
     bool        portMap;
 
     std::string externalIp;
+    std::vector<std::string> externalIps;
     std::vector<std::string> seedNodes;
     std::vector<std::string> addNodes;
     std::vector<std::string> connectNodes;
+
+    std::string proxy;
+    std::string onionProxy;
+    bool        proxyRandomize;
+    std::vector<std::string> onlyNets;
+    bool        discover;
+    bool        listenOnion;
+    std::string torControl;
+    std::string torPassword;
+    std::vector<std::string> binds;
 
     NetworkConfig()
         : port(NetParams::DEFAULT_PORT)
@@ -56,6 +67,10 @@ struct NetworkConfig {
         , listen(true)
         , upnp(false)
         , portMap(true)
+        , proxyRandomize(true)
+        , discover(true)
+        , listenOnion(true)
+        , torControl("127.0.0.1:9051")
     {}
 };
 

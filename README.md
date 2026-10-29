@@ -104,6 +104,8 @@ be spent now and what is still waiting to mature.
 Full specification available in
 [MONEU-White-Paper_EN.md](MONEU-White-Paper_EN.md)
 
+Running a node through Tor: [TOR.md](TOR.md)
+
 ## License
 
 Distributed under the MIT License. See [LICENSE](LICENSE) for details.
