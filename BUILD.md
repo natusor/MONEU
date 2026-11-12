@@ -12,6 +12,10 @@ Ubuntu 24.04 / Debian:
 `nlohmann-json3-dev` is required by `src/rpc` and `libssl-dev` by
 `src/crypto/secure_enc.cpp` (AES-256-CBC).
 
+MI the MONEU Interface needs Qt 5 as well:
+
+    apt-get install -y qtbase5-dev qtbase5-dev-tools
+
 LevelDB is built from `src/leveldb`, so no system package is needed for it.
 
 ## Build
@@ -37,6 +41,17 @@ Unpacking the archive already puts you one level above it so if `ls` shows CMake
 you are in the right place and there is nothing further to cd into.
 
 Produces `moneud`, `moneu-cli` and `moneu-test-noise`.
+
+## MI the MONEU Interface
+
+MI is built only when it is asked for:
+
+    rm -rf build
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_MI=ON
+    cmake --build build -j$(nproc)
+
+Produces `build/src/mi/moneu-mi` next to the node binaries. Without
+`-DBUILD_MI=ON` the build is the same as above and Qt is not needed.
 
 ## Self-test
 

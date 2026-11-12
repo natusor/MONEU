@@ -37,6 +37,22 @@ cmake --build build -j$(nproc)
 The node ships with built-in mining software. 
 No separate miner and no pool required.
 
+### MI MONEU Interface
+
+The window program MI is built when you add `-DBUILD_MI=ON` and it needs Qt 5.
+
+```
+apt install -y qtbase5-dev qtbase5-dev-tools
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_MI=ON
+cmake --build build -j$(nproc)
+./build/src/mi/moneu-mi
+```
+
+It starts the node inside by itself and with buttons it handles mining and
+creating the wallet and addresses and the noise file and everything that is
+needed to make transactions. MI and moneud use the same data directory so run
+one of them at a time. If moneud is already running MI connects to it.
+
 ### Requirements
 
 Ubuntu 22.04 or newer or Debian. 
