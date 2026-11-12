@@ -904,7 +904,7 @@ int InteractiveMain() {
         return 1;
     }
 
-    std::cout << "MONEU 0.2.4\n\n";
+    std::cout << "MONEU 0.2.5\n\n";
 
     std::cout << "Checking this computer... " << std::flush;
     const std::string logPath = AppTempLogPath();
@@ -986,7 +986,11 @@ int InteractiveMain() {
 }
 #endif
 
+#ifdef MONEU_MI
+int MoneuNodeMain(int argc, char* argv[]) {
+#else
 int main(int argc, char* argv[]) {
+#endif
 #ifdef WIN32
     ::SetConsoleOutputCP(::GetACP());
 #endif
@@ -1002,7 +1006,7 @@ int main(int argc, char* argv[]) {
 
     if (HasArg(args, "version") || HasArg(args, "v")) {
         std::cout
-            << "MONEU Node v0.2.4\n"
+            << "MONEU Node v0.2.5\n"
             << "Network:   " << NetParams::NETWORK_ID << "\n"
             << "Consensus: Proof-of-Work (SHA-256)\n"
             << "P2P Port:  " << NetParams::DEFAULT_PORT << "\n"
@@ -1028,7 +1032,7 @@ int main(int argc, char* argv[]) {
     MoneuNode node;
 
     try {
-        std::cout << "MONEU Node v0.2.4 starting\n";
+        std::cout << "MONEU Node v0.2.5 starting\n";
 
         std::string dataDirStr = GetArgValue(args, "datadir", "");
         if (!dataDirStr.empty()) {
@@ -1099,7 +1103,7 @@ int main(int argc, char* argv[]) {
         InitLogger(*node.dataDir, node.config.GetLog());
         CleanupOldCookie(node.dataDir->GetDataDir());
 
-        LOG_INFO("MONEU Node v0.2.4");
+        LOG_INFO("MONEU Node v0.2.5");
         LOG_INFO("Network:   " + std::string(NetParams::NETWORK_ID));
         LOG_INFO("Consensus: Proof-of-Work (SHA-256)");
         LOG_INFO("DataDir:   " + node.dataDir->GetDataDir().string());

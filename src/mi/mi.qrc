@@ -1,0 +1,6 @@
+<!DOCTYPE RCC><RCC version="1.0">
+<qresource prefix="/mi">
+    <file alias="moneu_1024.png">../../logo/moneu_1024.png</file>
+    <file alias="moneu_64.png">../../logo/moneu_64.png</file>
+</qresource>
+</RCC>

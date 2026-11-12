@@ -139,3 +139,8 @@ if(WIN32)
         ${CMAKE_DL_LIBS}
     )
 endif()
+
+option(BUILD_MI "Build moneu-mi, the MONEU Interface" OFF)
+if(BUILD_MI)
+    add_subdirectory(mi)
+endif()

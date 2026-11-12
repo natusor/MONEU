@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(moneu VERSION 0.2.4 LANGUAGES C CXX)
+project(moneu VERSION 0.2.5 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

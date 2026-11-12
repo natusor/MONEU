@@ -15,7 +15,7 @@ namespace NetParams {
 
 const uint8_t MAINNET_MAGIC[4] = {0xB6, 0xFD, 0xFA, 0x84};
 const char* NETWORK_ID = "moneu";
-const char* USER_AGENT = "/MONEU:0.2.4/";
+const char* USER_AGENT = "/MONEU:0.2.5/";
 
 const uint16_t DEFAULT_PORT = 8327;
 const uint16_t RPC_PORT = 8328;
