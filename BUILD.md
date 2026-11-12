@@ -1,4 +1,4 @@
-# MONEU — building
+# Building MONEU
 
 ## Dependencies
 
@@ -112,3 +112,11 @@ Then the node:
 
 Produces `moneu.exe`, `moneud.exe`, `moneu-cli.exe` and `moneu-test-noise.exe`
 in `build-win/src`. `moneu.exe` alone is enough to run a node.
+
+For MI on Windows build Qt once more into the same folder. It is checked
+against the hash in `depends/packages/qt.mk` and takes a while:
+
+    make -C depends HOST=x86_64-w64-mingw32 -j$(nproc) qt
+
+Then add `-DBUILD_MI=ON` to the cmake line above. Produces
+`build-win/src/mi/moneu-mi.exe`, one file with Qt built in.

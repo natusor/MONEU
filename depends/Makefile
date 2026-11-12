@@ -1,4 +1,4 @@
-.PHONY: all clean download openssl boost nlohmann_json toolchain
+.PHONY: all clean download openssl boost nlohmann_json toolchain qt
 
 .DEFAULT_GOAL := all
 
@@ -18,6 +18,7 @@ JOBS ?= $(shell nproc 2>/dev/null || echo 2)
 include packages/openssl.mk
 include packages/boost.mk
 include packages/nlohmann_json.mk
+include packages/qt.mk
 
 all: openssl boost nlohmann_json toolchain
 	@echo
@@ -49,6 +50,7 @@ download:
 	$(call fetch,$(openssl_url),$(openssl_file),$(openssl_sha256))
 	$(call fetch,$(boost_url),$(boost_file),$(boost_sha256))
 	$(call fetch,$(nlohmann_json_url),$(nlohmann_json_file),$(nlohmann_json_sha256))
+	$(call fetch,$(qt_url),$(qt_file),$(qt_sha256))
 
 toolchain: | $(PREFIX)
 	@echo "Writing $(PREFIX)/toolchain.cmake"
@@ -61,8 +63,8 @@ toolchain: | $(PREFIX)
 	  'set(CMAKE_CXX_COMPILER $(CXX))' \
 	  'set(CMAKE_RC_COMPILER  $(HOST)-windres)' \
 	  '' \
-	  '# Look for libraries and headers here first, and only here.' \
-	  'set(CMAKE_FIND_ROOT_PATH $(PREFIX))' \
+	  '# Look for libraries and headers here and in the mingw system libraries.' \
+	  'set(CMAKE_FIND_ROOT_PATH $(PREFIX) /usr/$(HOST))' \
 	  'set(CMAKE_PREFIX_PATH    $(PREFIX))' \
 	  'set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)' \
 	  'set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)' \
