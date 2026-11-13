@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     name: Build and test (Ubuntu)
@@ -31,3 +34,40 @@ jobs:
         run: |
           ./build/src/moneu-test-noise | tee test-output.log
           grep -q "ALL TESTS DONE" test-output.log
+
+  sanitizers:
+    name: Sanitizers (ASan + UBSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake \
+            libboost-filesystem-dev libboost-system-dev \
+            libboost-thread-dev libboost-program-options-dev \
+            libssl-dev nlohmann-json3-dev
+
+      - name: Configure with ASan + UBSan
+        run: >
+          cmake -S . -B build-san
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_FLAGS_RELWITHDEBINFO="-g -O1"
+          -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-g -O1"
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build-san -j"$(nproc)"
+
+      - name: Run the self-test under sanitizers
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ./build-san/src/moneu-test-noise | tee san-output.log
+          grep -q "ALL TESTS DONE" san-output.log

@@ -24,6 +24,11 @@
 
 namespace MONEU {
 
+// Out-of-line definition required under C++14: INCREMENTAL_FEE_PER_K is
+// ODR-used (bound to a const& by std::max in GetMinFeeRateLocked), so the
+// static constexpr member needs a definition here. Redundant from C++17 on.
+constexpr int64_t Mempool::INCREMENTAL_FEE_PER_K;
+
 bool Mempool::ExtractLeafKeys(const Transaction& tx,
                               std::vector<std::string>& leafKeys) {
     leafKeys.clear();
