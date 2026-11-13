@@ -17,12 +17,12 @@ class QMutex;
 namespace mi {
 
 namespace color {
-static const QColor Paper(0xF1, 0xEC, 0xE0);
+static const QColor Paper(0xFB, 0xFA, 0xF6);
 static const QColor PaperSpeck(0xB8, 0xB0, 0x9C);
-static const QColor Card(0xFC, 0xF8, 0xF1);
-static const QColor CardBand(0xE6, 0xE9, 0xE4);
+static const QColor Card(0xFF, 0xFF, 0xFF);
+static const QColor CardBand(0xEC, 0xEF, 0xEB);
 static const QColor Ink(0x1C, 0x1C, 0x14);
-static const QColor InkSoft(0x3F, 0x3B, 0x33);
+static const QColor InkSoft(0x2A, 0x27, 0x20);
 static const QColor Title(0xB4, 0x5A, 0x14);
 static const QColor Unit(0xB0, 0x5E, 0x22);
 static const QColor Green(0x1E, 0x78, 0x36);
@@ -35,6 +35,14 @@ static const QColor Dash(0xD6, 0xD0, 0xC0);
 static const QColor Red(0xB3, 0x26, 0x1E);
 static const QColor Disabled(0x9A, 0x95, 0x8A);
 }
+
+// Size of the main window at full scale.
+static const int MI_FULL_WIDTH = 1480;
+static const int MI_FULL_HEIGHT = 820;
+
+void SetUiScale(qreal scale);
+qreal UiScale();
+int Px(qreal size);
 
 QFont MonoFont(int pixelSize, bool bold = false, qreal letterSpacing = 0.0);
 

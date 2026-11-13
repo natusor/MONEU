@@ -16,22 +16,30 @@
 
 #include <QApplication>
 #include <QIcon>
+#include <QScreen>
 #include <QStringList>
 
 #include <string>
 #include <vector>
 
 static const char* MI_STYLE =
-    "QDialog, QMessageBox { background: #F1ECE0; }"
+    "QDialog, QMessageBox { background: #FBFAF6; }"
     "QDialog QLabel, QMessageBox QLabel { color: #1C1C14; }"
-    "QLineEdit { background: #FCF8F1; color: #1C1C14;"
+    "QLineEdit { background: #FFFFFF; color: #1C1C14;"
     "  border: 2px solid #1C1C14; border-radius: 6px; padding: 5px 8px; }"
-    "QPushButton { background: #1E7836; color: white; font-weight: bold;"
-    "  border: 2px solid #C9A633; border-radius: 7px; padding: 6px 16px;"
+    "QPushButton { color: white; font-weight: bold;"
+    "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    "    stop:0 #46CCBA, stop:0.45 #14A392, stop:1 #0B766A);"
+    "  border: 2px solid #9AA3A8; border-radius: 7px; padding: 6px 16px;"
     "  min-width: 70px; }"
-    "QPushButton:disabled { background: #C9C4B8; border-color: #9A958A; }"
-    "QPushButton:hover { background: #238540; }"
-    "QTableWidget { background: #FCF8F1; alternate-background-color: #F4EFE3;"
+    "QPushButton:disabled { color: #E4E6E8;"
+    "  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    "    stop:0 #9CA3A9, stop:1 #656C72); border-color: #7D8388; }"
+    "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    "    stop:0 #58D8C7, stop:0.45 #1CB2A0, stop:1 #0F8577); }"
+    "QPushButton:pressed { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    "    stop:0 #12907F, stop:1 #08665B); }"
+    "QTableWidget { background: #FFFFFF; alternate-background-color: #F5F4EF;"
     "  color: #1C1C14; gridline-color: #D6D0C0; border: 2px solid #1C1C14;"
     "  selection-background-color: #CFE6D5; selection-color: #1C1C14; }"
     "QHeaderView::section { background: #E6E1D3; color: #1C1C14;"
@@ -41,7 +49,7 @@ static const char* MI_STYLE =
     "QProgressBar::chunk { background: #1E7836; border-radius: 5px; }"
     "QCheckBox { color: #1C1C14; }"
     "QDialogButtonBox { dialogbuttonbox-buttons-have-icons: 0; }"
-    "QToolTip { background: #FCF8F1; color: #1C1C14; border: 1px solid #1C1C14; }";
+    "QToolTip { background: #FFFFFF; color: #1C1C14; border: 1px solid #1C1C14; }";
 
 int main(int argc, char* argv[])
 {
@@ -51,8 +59,19 @@ int main(int argc, char* argv[])
 #endif
     QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
     QCoreApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
+    // Windows at 125 or 150 percent keeps that exact factor. Rounded to a whole
+    // number it made the window larger than the screen.
+    QGuiApplication::setHighDpiScaleFactorRoundingPolicy(
+        Qt::HighDpiScaleFactorRoundingPolicy::PassThrough);
+#endif
 
     QApplication app(argc, argv);
+    if (QScreen* screen = QGuiApplication::primaryScreen()) {
+        const QRect avail = screen->availableGeometry();
+        mi::SetUiScale(qMin(avail.width() * 0.94 / mi::MI_FULL_WIDTH,
+                            avail.height() * 0.90 / mi::MI_FULL_HEIGHT));
+    }
     QApplication::setOrganizationName(QStringLiteral("MONEU"));
     QApplication::setApplicationName(QStringLiteral("MI"));
     QApplication::setApplicationVersion(QStringLiteral(MI_VERSION));

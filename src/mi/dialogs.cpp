@@ -111,7 +111,7 @@ PassphraseDialog::PassphraseDialog(Mode mode, const QString& title,
     QFormLayout* f = new QFormLayout();
     mFirst = new QLineEdit(this);
     mFirst->setEchoMode(QLineEdit::Password);
-    mFirst->setMinimumWidth(400);
+    mFirst->setMinimumWidth(Px(400));
     f->addRow(Label(QStringLiteral("Passphrase"), this, 13, true), mFirst);
     if (mode == Create) {
         mSecond = new QLineEdit(this);
@@ -217,7 +217,7 @@ AddressDialog::AddressDialog(const QString& address, QWidget* parent)
     QLineEdit* field = new QLineEdit(address, this);
     field->setReadOnly(true);
     field->setFont(MonoFont(15, true));
-    field->setMinimumWidth(700);
+    field->setMinimumWidth(Px(700));
     v->addWidget(field);
 
     QDialogButtonBox* buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
@@ -235,7 +235,7 @@ AddressesDialog::AddressesDialog(const QVariantList& rows, QWidget* parent)
 {
     setWindowTitle(QStringLiteral("Addresses"));
     setModal(true);
-    resize(1180, 560);
+    resize(Px(1180), Px(560));
     QVBoxLayout* v = new QVBoxLayout(this);
     v->setContentsMargins(24, 22, 24, 18);
     v->setSpacing(12);
@@ -302,7 +302,7 @@ SendDialog::SendDialog(qint64 spendable, bool spendableKnown, QWidget* parent)
 
     QFormLayout* f = new QFormLayout();
     mAddress = new QLineEdit(this);
-    mAddress->setMinimumWidth(700);
+    mAddress->setMinimumWidth(Px(700));
     mAddress->setFont(MonoFont(14, true));
     mAmount = new QLineEdit(this);
     mAmount->setPlaceholderText(QStringLiteral("0.00000000"));
@@ -540,7 +540,7 @@ TxDetailsDialog::TxDetailsDialog(const TxRecord& r, qint64 tip, QWidget* parent)
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     v->addWidget(buttons);
-    setMinimumWidth(980);
+    setMinimumWidth(Px(980));
 }
 
 HistoryDialog::HistoryDialog(const QVector<TxRecord>& records, qint64 tip,
@@ -551,7 +551,7 @@ HistoryDialog::HistoryDialog(const QVector<TxRecord>& records, qint64 tip,
 {
     setWindowTitle(QStringLiteral("History"));
     setModal(true);
-    resize(1500, 680);
+    resize(Px(1500), Px(680));
     QVBoxLayout* v = new QVBoxLayout(this);
     v->setContentsMargins(24, 22, 24, 18);
     v->setSpacing(12);
@@ -606,7 +606,7 @@ NetworkDialog::NetworkDialog(const QVariantMap& d, QWidget* parent)
 {
     setWindowTitle(QStringLiteral("Network"));
     setModal(true);
-    resize(1180, 580);
+    resize(Px(1180), Px(580));
     QVBoxLayout* v = new QVBoxLayout(this);
     v->setContentsMargins(24, 22, 24, 18);
     v->setSpacing(12);
@@ -709,7 +709,7 @@ BusyDialog::BusyDialog(const QString& text, QWidget* parent)
     v->setSpacing(12);
     mText = Label(text, this, 14, true);
     mText->setWordWrap(false);
-    mText->setMinimumWidth(580);
+    mText->setMinimumWidth(Px(580));
     v->addWidget(mText);
     mBar = new QProgressBar(this);
     mBar->setRange(0, 0);
@@ -765,7 +765,7 @@ ShutdownWindow::ShutdownWindow(QWidget* parent)
     v->addWidget(Label(QStringLiteral("MONEU is shutting down...\n\n"
                                       "Do not shut down the computer until "
                                       "this window disappears."), this, 14, true));
-    setMinimumWidth(580);
+    setMinimumWidth(Px(580));
 }
 
 void ShutdownWindow::closeEvent(QCloseEvent* event)

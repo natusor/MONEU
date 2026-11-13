@@ -28,7 +28,7 @@ class MiButton : public QAbstractButton {
     Q_OBJECT
 
 public:
-    enum Style { Green, Yellow, Small, Arrow };
+    enum Style { Green, Yellow, Small, Arrow, Graphite };
 
     MiButton(const QString& text, Style style, QWidget* parent = nullptr);
 

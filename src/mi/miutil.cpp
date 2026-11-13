@@ -25,6 +25,25 @@ namespace mi {
 // the whole interface reads.
 static const qreal TEXT_SCALE = 1.25;
 
+// Set once at start from the size of the screen, so the whole window fits
+// on a small laptop screen the same way it fits on a large one.
+static qreal g_uiScale = 1.0;
+
+void SetUiScale(qreal scale)
+{
+    g_uiScale = qBound<qreal>(0.6, scale, 1.0);
+}
+
+qreal UiScale()
+{
+    return g_uiScale;
+}
+
+int Px(qreal size)
+{
+    return qRound(size * g_uiScale);
+}
+
 QFont MonoFont(int pixelSize, bool bold, qreal letterSpacing)
 {
     QFont f(QStringLiteral("DejaVu Sans Mono"));
@@ -32,10 +51,14 @@ QFont MonoFont(int pixelSize, bool bold, qreal letterSpacing)
 #if defined(WIN32)
     f.setFamily(QStringLiteral("Consolas"));
 #endif
-    f.setPixelSize(qRound(pixelSize * TEXT_SCALE));
+    // Never below 12 pixels, so no text in MI gets too small to read.
+    f.setPixelSize(qMax(12, qRound(pixelSize * TEXT_SCALE * g_uiScale)));
     f.setBold(bold);
+    f.setHintingPreference(QFont::PreferFullHinting);
     if (letterSpacing != 0.0) {
-        f.setLetterSpacing(QFont::AbsoluteSpacing, letterSpacing * TEXT_SCALE);
+        // Whole pixels only. A fraction of a pixel between letters blurs them.
+        f.setLetterSpacing(QFont::AbsoluteSpacing,
+                           qMax<qreal>(1.0, qRound(letterSpacing * TEXT_SCALE * g_uiScale)));
     }
     return f;
 }

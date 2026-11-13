@@ -18,6 +18,7 @@
 #include <QScreen>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QStyle>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -115,7 +116,9 @@ MainWindow::MainWindow(const std::vector<std::string>& nodeArgs,
 
 MainWindow::~MainWindow()
 {
-    if (mHistory) mHistory->RequestStop();
+    // After a normal close the history thread has finished and already
+    // deleted the scanner, so it is told to stop only while that thread runs.
+    if (mHistory && !mHistoryThread.isFinished()) mHistory->RequestStop();
     mPollThread.quit();
     mActionThread.quit();
     mHistoryThread.quit();
@@ -154,9 +157,9 @@ void MainWindow::BuildUi()
     setCentralWidget(root);
 
     QGridLayout* g = new QGridLayout(root);
-    g->setContentsMargins(32, 12, 32, 20);
-    g->setHorizontalSpacing(36);
-    g->setVerticalSpacing(10);
+    g->setContentsMargins(Px(32), Px(10), Px(32), Px(16));
+    g->setHorizontalSpacing(Px(36));
+    g->setVerticalSpacing(Px(8));
 
     QLabel* title = MakeLabel(QStringLiteral("MONEU"), MonoFont(40, true, 112.0),
                               color::Title, root);
@@ -165,7 +168,7 @@ void MainWindow::BuildUi()
     g->addWidget(title, 0, 0, 1, 3);
 
     mShield = new ShieldCard(root);
-    mShield->setFixedWidth(410);
+    mShield->setFixedWidth(Px(410));
     g->addWidget(mShield, 1, 0, Qt::AlignTop);
 
     g->addWidget(BuildBalance(root), 1, 1, Qt::AlignTop);
@@ -173,30 +176,33 @@ void MainWindow::BuildUi()
     QWidget* history = BuildHistory(root);
     QHBoxLayout* historyRow = new QHBoxLayout();
     historyRow->setContentsMargins(0, 0, 0, 0);
-    historyRow->addSpacing(150);
+    historyRow->addSpacing(Px(150));
     historyRow->addWidget(history, 0, Qt::AlignLeft);
     historyRow->addStretch(1);
     g->addLayout(historyRow, 2, 0, 1, 2);
 
     mStatus = new QLabel(root);
-    mStatus->setFont(MonoFont(12, true));
+    mStatus->setFont(MonoFont(14, true));
     mStatus->setTextFormat(Qt::RichText);
     mStatus->setWordWrap(false);
-    SetInk(mStatus, color::InkSoft);
+    SetInk(mStatus, color::Ink);
     connect(mStatus, &QLabel::linkActivated, this, [this](const QString&) {
         if (!mBusy) PromptUnlock(nullptr);
     });
     g->addWidget(mStatus, 3, 0, 1, 2, Qt::AlignBottom | Qt::AlignLeft);
 
     QWidget* right = BuildRightPanel(root);
-    right->setFixedWidth(420);
+    right->setFixedWidth(Px(420));
     g->addWidget(right, 0, 2, 4, 1);
 
     g->setColumnStretch(1, 1);
     g->setRowStretch(2, 1);
 
+    // Opens as a window in the middle of the screen, never over the whole of it.
     const QRect screen = QGuiApplication::primaryScreen()->availableGeometry();
-    resize(qMin(1480, screen.width() - 40), qMin(900, screen.height() - 60));
+    const QSize start(qMin(Px(MI_FULL_WIDTH), qRound(screen.width() * 0.94)),
+                      qMin(Px(MI_FULL_HEIGHT), qRound(screen.height() * 0.90)));
+    setGeometry(QStyle::alignedRect(Qt::LeftToRight, Qt::AlignCenter, start, screen));
     root->setFocusPolicy(Qt::StrongFocus);
     root->setFocus();
 }
@@ -205,19 +211,19 @@ QWidget* MainWindow::BuildBalance(QWidget* parent)
 {
     QWidget* box = new QWidget(parent);
     QVBoxLayout* v = new QVBoxLayout(box);
-    v->setContentsMargins(0, 8, 0, 0);
-    v->setSpacing(4);
+    v->setContentsMargins(0, Px(8), 0, 0);
+    v->setSpacing(Px(4));
 
     v->addWidget(MakeLabel(QStringLiteral("BALANCE"), MonoFont(15, true, 3.0),
                            color::Ink, box));
 
     QHBoxLayout* top = new QHBoxLayout();
     QVBoxLayout* total = new QVBoxLayout();
-    total->setSpacing(2);
+    total->setSpacing(Px(2));
     total->addWidget(MakeLabel(QStringLiteral("Total balance"),
                                MonoFont(13, true, 0.5), color::InkSoft, box));
     QHBoxLayout* amount = new QHBoxLayout();
-    amount->setSpacing(8);
+    amount->setSpacing(Px(8));
     mBalance = MakeLabel(QStringLiteral("—"), MonoFont(30, true),
                          color::Ink, box);
     amount->addWidget(mBalance, 0, Qt::AlignBottom);
@@ -228,14 +234,14 @@ QWidget* MainWindow::BuildBalance(QWidget* parent)
     top->addLayout(total, 1);
 
     mSend = new MiButton(QStringLiteral("→ SEND"), MiButton::Green, box);
-    mSend->setFixedSize(180, 64);
+    mSend->setFixedSize(Px(150), Px(46));
     connect(mSend, &QAbstractButton::clicked, this, &MainWindow::OnSend);
     top->addWidget(mSend, 0, Qt::AlignVCenter);
     v->addLayout(top);
-    v->addSpacing(8);
+    v->addSpacing(Px(8));
 
     QHBoxLayout* parts = new QHBoxLayout();
-    parts->setSpacing(36);
+    parts->setSpacing(Px(36));
     QVBoxLayout* sp = new QVBoxLayout();
     sp->setSpacing(1);
     sp->addWidget(MakeLabel(QStringLiteral("Spendable"), MonoFont(13, true, 0.5),
@@ -259,8 +265,8 @@ QWidget* MainWindow::BuildBalance(QWidget* parent)
     // block is shown here until it is in one.
     mPendingRow = new QWidget(box);
     QHBoxLayout* pr = new QHBoxLayout(mPendingRow);
-    pr->setContentsMargins(0, 6, 0, 0);
-    pr->setSpacing(10);
+    pr->setContentsMargins(0, Px(6), 0, 0);
+    pr->setSpacing(Px(10));
     pr->addWidget(MakeLabel(QStringLiteral("Waiting for a block"),
                             MonoFont(13, true, 0.5), color::InkSoft, mPendingRow));
     mPending = MakeLabel(QString(), MonoFont(14, true), color::Ink, mPendingRow);
@@ -274,21 +280,21 @@ QWidget* MainWindow::BuildBalance(QWidget* parent)
 QWidget* MainWindow::BuildHistory(QWidget* parent)
 {
     QWidget* box = new QWidget(parent);
-    box->setFixedWidth(740);
+    box->setFixedWidth(Px(740));
     QVBoxLayout* v = new QVBoxLayout(box);
-    v->setContentsMargins(0, 18, 0, 0);
-    v->setSpacing(6);
+    v->setContentsMargins(0, Px(14), 0, 0);
+    v->setSpacing(Px(6));
 
     QHBoxLayout* head = new QHBoxLayout();
     head->addWidget(MakeLabel(QStringLiteral("HISTORY"), MonoFont(15, true, 3.0),
                               color::Ink, box));
     head->addStretch(1);
     mAll = new MiButton(QStringLiteral("ALL"), MiButton::Small, box);
-    mAll->setFixedSize(92, 46);
+    mAll->setFixedSize(Px(84), Px(38));
     connect(mAll, &QAbstractButton::clicked, this, &MainWindow::OnAll);
     head->addWidget(mAll);
     v->addLayout(head);
-    v->addSpacing(4);
+    v->addSpacing(Px(4));
 
     mNoHistory = MakeLabel(QStringLiteral("No transactions yet."),
                            MonoFont(13, true), color::InkSoft, box);
@@ -298,8 +304,8 @@ QWidget* MainWindow::BuildHistory(QWidget* parent)
         HistoryRow row;
         row.box = new QWidget(box);
         QGridLayout* g = new QGridLayout(row.box);
-        g->setContentsMargins(0, 4, 0, 6);
-        g->setHorizontalSpacing(12);
+        g->setContentsMargins(0, Px(4), 0, Px(6));
+        g->setHorizontalSpacing(Px(12));
         g->setVerticalSpacing(1);
         row.type = MakeLabel(QString(), MonoFont(16, true), color::Ink, row.box);
         row.address = MakeLabel(QString(), MonoFont(13, true), color::Ink, row.box);
@@ -311,7 +317,7 @@ QWidget* MainWindow::BuildHistory(QWidget* parent)
                              color::Unit, row.box);
         row.unit->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         row.arrow = new MiButton(QString(), MiButton::Arrow, row.box);
-        row.arrow->setFixedSize(46, 46);
+        row.arrow->setFixedSize(Px(40), Px(40));
         connect(row.arrow, &QAbstractButton::clicked, this, [this, i]() { OnRow(i); });
         g->addWidget(row.type, 0, 0);
         g->addWidget(row.amount, 0, 1);
@@ -333,7 +339,7 @@ QWidget* MainWindow::BuildRightPanel(QWidget* parent)
     QWidget* box = new QWidget(parent);
     QVBoxLayout* v = new QVBoxLayout(box);
     v->setContentsMargins(0, 0, 0, 0);
-    v->setSpacing(4);
+    v->setSpacing(Px(4));
 
     mLogo = new CoinLogo(box);
     v->addWidget(mLogo, 0, Qt::AlignHCenter);
@@ -357,17 +363,17 @@ QWidget* MainWindow::BuildRightPanel(QWidget* parent)
     addRow(QStringLiteral("Network hash"), mNetHash);
     v->addWidget(new DashedLine(box));
     addRow(QStringLiteral("Next bits"), mNextBits);
-    v->addSpacing(10);
+    v->addSpacing(Px(10));
 
     QGridLayout* buttons = new QGridLayout();
-    buttons->setHorizontalSpacing(12);
-    buttons->setVerticalSpacing(12);
+    buttons->setHorizontalSpacing(Px(12));
+    buttons->setVerticalSpacing(Px(12));
     mStartMining = new MiButton(QStringLiteral("START MINING"), MiButton::Green, box);
-    mStopMining = new MiButton(QStringLiteral("STOP MINING"), MiButton::Green, box);
+    mStopMining = new MiButton(QStringLiteral("STOP MINING"), MiButton::Graphite, box);
     mNewAddress = new MiButton(QStringLiteral("NEW ADDRESS"), MiButton::Green, box);
     mAddresses = new MiButton(QStringLiteral("ADDRESSES"), MiButton::Green, box);
     for (MiButton* b : {mStartMining, mStopMining, mNewAddress, mAddresses}) {
-        b->setMinimumSize(196, 58);
+        b->setMinimumSize(Px(190), Px(46));
         b->setFont(MonoFont(14, true, 0.8));
     }
     buttons->addWidget(mStartMining, 0, 0);
@@ -375,19 +381,31 @@ QWidget* MainWindow::BuildRightPanel(QWidget* parent)
     buttons->addWidget(mNewAddress, 1, 0);
     buttons->addWidget(mAddresses, 1, 1);
     v->addLayout(buttons);
-    v->addSpacing(8);
+    v->addSpacing(Px(8));
 
     addRow(QStringLiteral("Connected nodes"), mPeers);
     v->addWidget(new DashedLine(box));
     addRow(QStringLiteral("Block height"), mHeight);
-    v->addSpacing(12);
+    v->addSpacing(Px(8));
+
+    QLabel* samePass = MakeLabel(
+        QStringLiteral("Use the same passphrase for the noise file as for the wallet."),
+        MonoFont(14, true), Qt::white, box);
+    samePass->setWordWrap(true);
+    samePass->setStyleSheet(QStringLiteral(
+        "QLabel { color: white; border: 2px solid #5B16B0; border-radius: %1px;"
+        " padding: %2px %3px; background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+        " stop:0 #B46CFF, stop:1 #7A2BE2); }")
+        .arg(Px(8)).arg(Px(5)).arg(Px(9)));
+    v->addWidget(samePass);
+    v->addSpacing(Px(8));
 
     QHBoxLayout* yellow = new QHBoxLayout();
-    yellow->setSpacing(12);
+    yellow->setSpacing(Px(12));
     mCreateWallet = new MiButton(QStringLiteral("CREATE WALLET"), MiButton::Yellow, box);
     mNoiseFile = new MiButton(QStringLiteral("NOISE FILE"), MiButton::Yellow, box);
     for (MiButton* b : {mCreateWallet, mNoiseFile}) {
-        b->setMinimumSize(196, 58);
+        b->setMinimumSize(Px(190), Px(46));
         b->setFont(MonoFont(14, true, 0.8));
     }
     yellow->addWidget(mCreateWallet);
@@ -657,7 +675,8 @@ void MainWindow::OnActionFinished(const ActionResult& r)
             mNoisePass.clear();
             mBusy = false;
             UpdateButtons();
-            ShowError(r.text);
+            ShowError(r.text + QStringLiteral("\n\nThe noise file needs the same "
+                                              "passphrase you chose for the wallet."));
             return;
         }
         BusyDialog* d = new BusyDialog(
@@ -859,8 +878,8 @@ void MainWindow::OnNoiseFile()
         return;
     }
     PassphraseDialog d(PassphraseDialog::Single, QStringLiteral("Noise file"),
-                       QStringLiteral("Enter the passphrase of your wallet. The "
-                                      "noise file is encrypted with it."), this);
+                       QStringLiteral("Enter the same passphrase you chose for the "
+                                      "wallet. The noise file is encrypted with it."), this);
     if (d.exec() != QDialog::Accepted) return;
     const QString pass = d.Passphrase();
     if (pass.toStdString().size() < 8) {
